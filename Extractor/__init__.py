@@ -22,7 +22,8 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workdir="sessions",
-    workers=200,
+    workers=10,
+max_concurrent_transmissions=1,
 )
 
 # Initialize pyromod attributes
