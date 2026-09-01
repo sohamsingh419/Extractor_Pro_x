@@ -1,5 +1,4 @@
 
-import requests
 import datetime
 import pytz
 import re
@@ -9,6 +8,8 @@ import base64
 import asyncio
 import time
 import json
+import hmac
+import hashlib
 from pyrogram import filters
 from Extractor import app
 from config import CHANNEL_ID, THUMB_URL
@@ -32,69 +33,46 @@ EDIT_LOCK = asyncio.Lock()
 # ═══════════════════════════════════════════════════════════════
 # NEW API CONFIGURATION (api.asmultiverse.app)
 # ═══════════════════════════════════════════════════════════════
-BASE_URL = "https://api.asmultiverse.app/api/v1/utkarsh"
-CLIENT_ID = "2cfbaa6be65acdc5"
+BASE_URL = "https://api.asmultiverse.app"
+DEVICE_ID = "2cfbaa6be65acdc5"
+
+# Secret key for MadX-Auth-Signature (base64 encoded)
+# Algorithm: HMAC-SHA256(key=base64_decode(SECRET_KEY), msg=timestamp_string)
+SECRET_KEY = "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0="
 
 # Default Bearer token used for the LOGIN endpoint.
-# This token is hardcoded in the Utkarsh app and is required
-# to call /login. It may expire — update if login fails.
+# This token is hardcoded in the Utkarsh app.
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjE0NDQ2MTEzIiwiZGV2aWNlX3R5cGUiOiI0IiwidmVyc2lvbl9jb2RlIjoiMSIsImljciI6IjAiLCJpYXQiOjE3ODgyMzYwOTYsImV4cCI6MTc5MDM5NjA5Nn0.Sn6Ad_klMRf3HJmE81ETHXSIGtSs1r4FyflU_77x3wI"
 
-# ═══════════════════════════════════════════════════════════════
-# ⚠️  CRITICAL TODO: MadX-Auth-Signature Generation
-# ═══════════════════════════════════════════════════════════════
-# The API requires a `MadX-Auth-Signature` header on EVERY request.
-# Without a valid signature, all calls return 401/403.
-#
-# What we know:
-#   • MadX-Auth-Key = base64(timestamp)  ✓ confirmed
-#   • Signature changes per request        ✓ confirmed
-#   • It is NOT any of these (tested & failed):
-#       – HMAC-SHA256(key="MadXABhi", msg=method+path+timestamp)
-#       – HMAC-SHA256(key=CLIENT_ID, msg=path+timestamp)
-#       – HMAC-SHA256(key=JWT_token, msg=path+timestamp)
-#       – HMAC-SHA256(key=JWT_payload.id, msg=path+timestamp)
-#       – HMAC-SHA256(key="", msg=path+timestamp)
-#       – SHA256/SHA1/MD5 of various combinations
-#
-# HOW TO FIND THE REAL ALGORITHM:
-#   1. Decompile Utkarsh APK (com.utkarsh.ABhi) with JADX
-#   2. Search strings: "MadX-Auth-Signature", "generateSignature",
-#      "signRequest", "getSignature"
-#   3. If the logic is in a native .so library, use Frida to hook
-#      the signing function at runtime
-#   4. The signature is most likely HMAC-SHA256 with a static key
-#      hidden somewhere in the app assets / native code.
-#
-# Once you find it, replace the body of generate_signature() below.
-# ═══════════════════════════════════════════════════════════════
-def generate_signature(method: str, path: str, timestamp: str) -> str:
+
+def generate_signature(timestamp: str) -> str:
     """
     Generate MadX-Auth-Signature for API requests.
-    ⛔ THIS IS A PLACEHOLDER — Replace with the real algorithm.
+    Verified against all HAR requests ✅
     """
-    # TODO: Replace with actual signature algorithm extracted from APK
-    return ""
+    key = base64.b64decode(SECRET_KEY)
+    signature = hmac.new(key, timestamp.encode(), hashlib.sha256).digest()
+    return base64.b64encode(signature).decode()
 
 
-def get_auth_headers(token: str, method: str, path: str) -> dict:
+def get_auth_headers(token: str = "") -> dict:
     """Build the complete header set for api.asmultiverse.app."""
     timestamp = str(int(time.time()))
     auth_key = base64.b64encode(timestamp.encode()).decode()
-    signature = generate_signature(method, path, timestamp)
-    return {
-        "authorization": f"Bearer {token}",
-        "X-Client-Id": CLIENT_ID,
-        "MadX-Auth-Signature": signature,
-        "X-Auth-Key": "",
-        "Cache-Control": "no-cache",
+    signature = generate_signature(timestamp)
+    headers = {
+        "X-Client-Id": DEVICE_ID,
         "MadX-Auth-Key": auth_key,
+        "MadX-Auth-Signature": signature,
+        "Cache-Control": "no-cache",
+        "User-Agent": "okhttp/3.9.1",
+        "Accept-Encoding": "gzip",
         "Connection": "keep-alive",
         "Content-Type": "application/json",
-        "Host": "api.asmultiverse.app",
-        "Accept-Encoding": "gzip",
-        "User-Agent": "okhttp/3.9.1",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 async def api_request(
@@ -106,7 +84,7 @@ async def api_request(
     retries=MAX_RETRIES,
 ):
     """Make an authenticated API request with exponential back-off."""
-    headers = get_auth_headers(token, method, path)
+    headers = get_auth_headers(token)
     url = f"{BASE_URL}{path}"
 
     for attempt in range(retries):
@@ -142,7 +120,7 @@ async def api_request(
 async def handle_utk_logic(app_client, m):
     start_time = time.time()
     editable = await m.reply_text(
-        "🔹 <b>UTK EXTRACTOR PRO (New API v2)</b> 🔹\n\n"
+        "🔹 <b>UTK EXTRACTOR PRO (New API v2)</b>\n\n"
         "Send **ID & Password** in this format: <code>ID*Password</code>"
     )
 
@@ -167,11 +145,11 @@ async def handle_utk_logic(app_client, m):
         # ── 2. Login ───────────────────────────────────────────
         login_payload = {"remember": True, "password": ps, "email": ids}
         try:
-            login_headers = get_auth_headers(DEFAULT_TOKEN, "POST", "/login")
+            login_headers = get_auth_headers(DEFAULT_TOKEN)
             login_headers["Content-Type"] = "application/json; charset=utf-8"
 
             async with session.post(
-                f"{BASE_URL}/login",
+                f"{BASE_URL}/api/v1/utkarsh/login",
                 headers=login_headers,
                 json=login_payload,
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
@@ -196,7 +174,7 @@ async def handle_utk_logic(app_client, m):
         await editable.edit("📚 Fetching your batches...")
         try:
             batches_resp = await api_request(
-                session, token, "GET", "/batches?page=1&limit=100"
+                session, token, "GET", "/api/v1/utkarsh/batches?page=1&limit=100"
             )
             if not batches_resp or not batches_resp.get("success"):
                 await editable.edit("❌ Failed to fetch batches from API.")
@@ -260,7 +238,7 @@ async def handle_utk_logic(app_client, m):
             try:
                 # 6a. Get sub-batches
                 batch_details = await api_request(
-                    session, token, "GET", f"/batches/{batch_id}/details"
+                    session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/details"
                 )
                 if not batch_details or not batch_details.get("success"):
                     await progress_msg.edit(
@@ -273,63 +251,65 @@ async def handle_utk_logic(app_client, m):
                     (
                         x["title"]
                         for x in sub_batches
-                        if str(x["_id"]) == batch_id
+                        if str(x.get("_id") or x.get("id")) == batch_id
                     ),
                     f"Batch_{batch_id}",
                 )
                 print(colored(f"\n📦 Processing batch: {bname} (ID: {batch_id})", "cyan"))
 
                 all_urls = []
+                total_links = 0
 
                 # 6b. Iterate sub-batches → subjects → topics → contents
                 for sub_batch in sub_batches:
-                    parent_id = sub_batch.get("parentId", batch_id)
+                    parent_id = sub_batch.get("parentId") or sub_batch.get("parent_id") or batch_id
+                    sub_batch_id = sub_batch.get("_id") or sub_batch.get("id")
 
                     # Subjects
                     subjects_resp = await api_request(
                         session,
                         token,
                         "GET",
-                        f"/batches/{batch_id}/parent/{parent_id}/details",
+                        f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/details",
                     )
                     if not subjects_resp or not subjects_resp.get("success"):
                         continue
                     subjects = subjects_resp.get("data", [])
                     print(colored(
-                        f"  📚 {len(subjects)} subjects in sub-batch {sub_batch.get('_id')}",
+                        f"  📚 {len(subjects)} subjects in sub-batch {sub_batch_id}",
                         "cyan",
                     ))
 
                     for subject in subjects:
-                        subject_id = subject.get("_id")
+                        subject_id = subject.get("_id") or subject.get("id")
 
                         # Topics
                         topics_resp = await api_request(
                             session,
                             token,
                             "GET",
-                            f"/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/details",
+                            f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/details",
                         )
                         if not topics_resp or not topics_resp.get("success"):
                             continue
                         topics = topics_resp.get("data", [])
 
                         for topic in topics:
-                            topic_id = topic.get("_id")
+                            topic_id = topic.get("_id") or topic.get("id")
 
                             # Contents list
                             contents_resp = await api_request(
                                 session,
                                 token,
                                 "GET",
-                                f"/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details",
+                                f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details",
                             )
                             if not contents_resp or not contents_resp.get("success"):
                                 continue
                             contents = contents_resp.get("data", [])
 
                             for content in contents:
-                                content_id = content.get("id")
+                                content_id = content.get("id") or content.get("_id")
                                 content_title = content.get("title", "Unknown")
 
                                 # Actual link
@@ -337,7 +317,7 @@ async def handle_utk_logic(app_client, m):
                                     session,
                                     token,
                                     "GET",
-                                    f"/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
+                                    f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
                                 )
                                 if not detail_resp or not detail_resp.get("success"):
                                     continue
@@ -348,8 +328,19 @@ async def handle_utk_logic(app_client, m):
                                     safe_title = (
                                         content_title.replace("||", "-")
                                         .replace(":", "-")
+                                        .replace("/", "-")
                                     )
                                     all_urls.append(f"{safe_title}: {link}")
+                                    total_links += 1
+
+                                    # Update progress periodically
+                                    if total_links % 50 == 0:
+                                        await safe_edit_message(
+                                            progress_msg,
+                                            f"⏳ <b>Processing {bname}</b>\n"
+                                            f"├─ Links found: {total_links}\n"
+                                            f"└─ Current: <code>{safe_title[:40]}...</code>"
+                                        )
 
                 if all_urls:
                     print(colored(
