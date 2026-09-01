@@ -7,7 +7,7 @@ API_ID = int(os.environ.get("API_ID", "32772113"))
 # ------------------------------------------------
 API_HASH = os.environ.get("API_HASH","79b81186aefef9ca9216c646152ffe45")
 # ------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8672812620:AAF5v-n6HGll24KMHk088sc6XaOCqWuPF2w")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8672812620:AAFiHHQ2Y-q71wQjLFH6-kDgdzAgcYgFIdw")
 # ------------------------------------------------
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "@GolbalXtxtExtractor_bot")
 BOT_TEXT = "GolbalXtxtExtractor bot"
