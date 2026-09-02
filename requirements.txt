@@ -1,5 +1,4 @@
-pyrogram==2.0.106
-pyromod==1.5
+pyrogram==2.3.69
 tgcrypto
 aiohttp
 aiofiles
@@ -9,16 +8,12 @@ cloudscraper
 pycryptodome
 pytz
 motor
-pyrofork
 PyJWT
-aiogram
 beautifulsoup4
 httpx
-python-telegram-bot==20.6
 tqdm
 colorama
 termcolor
-dotenv
+python-dotenv
 flask
-pyrogram
-tgcrypto
+pyromod==1.5

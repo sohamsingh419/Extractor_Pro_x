@@ -1,1 +1,1 @@
-worker: python -m Extractor
+web: python -m Extractor
