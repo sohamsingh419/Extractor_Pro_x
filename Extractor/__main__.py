@@ -3,6 +3,7 @@ import importlib
 import signal
 import os
 import threading
+import shutil
 from pyrogram import idle
 from Extractor.modules import ALL_MODULES
 
@@ -50,6 +51,12 @@ async def sumit_boot():
         importlib.import_module("Extractor.modules." + all_module)
 
     print("» ʙᴏᴛ ᴅᴇᴘʟᴏʏ sᴜᴄᴄᴇssғᴜʟʟʏ ✨ 🎉")
+    for binary in ("ffmpeg", "ffprobe", "yt-dlp", "aria2c"):
+        location = shutil.which(binary)
+        if location:
+            print(f"» {binary}: {location}")
+        else:
+            print(f"⚠️ Required media binary not found: {binary}")
 
     # idle() keeps the bot alive; wrap it so we can break out on signal
     idle_task = loop.create_task(idle())
