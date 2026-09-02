@@ -1,4 +1,5 @@
-pyrogram==2.3.69
+pyrogram==2.0.106
+pyromod==1.5
 tgcrypto
 aiohttp
 aiofiles
@@ -16,4 +17,3 @@ colorama
 termcolor
 python-dotenv
 flask
-pyromod==1.5
