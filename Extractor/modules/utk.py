@@ -222,21 +222,26 @@ def is_pdf_file(filepath):
 
 
 async def download_file(url, filepath, headers=None, timeout=120):
-    try:
-        h = headers or get_asset_headers()
-        r = requests.get(url, headers=h, timeout=timeout, stream=True)
-        if r.status_code != 200:
-            print(colored(f"  ⚠️ Download returned HTTP {r.status_code}: {url}", "yellow"))
-            return False
-        with open(filepath, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-            return False
-        return True
-    except Exception as e:
-        print(colored(f"  ⚠️ Direct download failed: {e}", "yellow"))
+    last_error = "unknown download error"
+    header_sets = [headers or get_asset_headers(), get_utkarsh_headers()]
+    for h in header_sets:
+        try:
+            r = requests.get(url, headers=h, timeout=timeout, stream=True, allow_redirects=True)
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}"
+                r.close()
+                continue
+            with open(filepath, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            r.close()
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return True
+            last_error = "empty response"
+        except Exception as e:
+            last_error = str(e)
+    print(colored(f"  ⚠️ Direct download failed ({last_error}): {url}", "yellow"))
     return False
 
 
@@ -316,6 +321,23 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
         await cleanup_file(downloaded_path)
         if thumb_path and thumb_path != "custom_thumb.jpg":
             await cleanup_file(thumb_path)
+
+
+async def upload_photo(bot_client, chat_id, filepath, caption):
+    downloaded_path = filepath
+    try:
+        if not os.path.exists(filepath):
+            return False, "downloaded image file is missing"
+        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption)
+        return True, ""
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await upload_photo(bot_client, chat_id, filepath, caption)
+    except Exception as e:
+        print(colored(f"  ❌ Upload image error: {e}", "red"))
+        return False, str(e)
+    finally:
+        await cleanup_file(downloaded_path)
 
 
 async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=None):
@@ -546,7 +568,25 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                 raise ValueError("thumbnail URL did not return an image")
             with open(thumb_path, "wb") as f:
                 f.write(r.content)
-            print(colored(f"  ✅ Thumbnail downloaded: {len(r.content)} bytes", "green"))
+            # Telegram thumbnails must be small; normalize S3 images before upload.
+            optimized_thumb = "custom_thumb_optimized.jpg"
+            thumb_result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", thumb_path,
+                    "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+                    "-q:v", "6", optimized_thumb,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if thumb_result.returncode != 0 or not os.path.exists(optimized_thumb):
+                raise RuntimeError(f"ffmpeg thumbnail conversion failed: {thumb_result.stderr[-300:]}")
+            os.replace(optimized_thumb, thumb_path)
+            thumb_size = os.path.getsize(thumb_path)
+            if thumb_size > 200 * 1024:
+                raise ValueError(f"thumbnail is too large after compression ({thumb_size} bytes)")
+            print(colored(f"  ✅ Thumbnail ready: {thumb_size} bytes", "green"))
         except Exception as e:
             print(colored(f"  ⚠️ Thumbnail download failed: {e}; using video frame", "yellow"))
             thumb_path = None
@@ -652,10 +692,12 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
 
             normalized_url = requests.utils.unquote(url).lower()
             is_note = ".ws" in normalized_url or "file_manager/notes" in normalized_url
+            is_image = any(ext in normalized_url.split("?")[0] for ext in (".jpg", ".jpeg", ".png", ".webp"))
             is_pdf = (
                 ".pdf" in normalized_url
                 or "pannel-files" in normalized_url
-                or (not is_note and await url_is_pdf(url))
+                or "file_manager/pdf" in normalized_url
+                or (not is_note and not is_image and await url_is_pdf(url))
             )
             is_m3u8 = ".m3u8" in normalized_url
 
@@ -676,11 +718,36 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                         success += 1
                     else:
                         failed += 1
+                        await app_client.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ <b>Note upload failed:</b> <code>{safe_title}</code>"
+                        )
                 else:
                     failed += 1
                     await app_client.send_message(
                         chat_id=chat_id,
                         text=f"❌ <b>Failed note download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                    )
+
+            elif is_image:
+                image_path = f"{name_prefix}.jpg"
+                ok = await download_file(url, image_path)
+                if ok and os.path.exists(image_path) and os.path.getsize(image_path) > 100:
+                    downloaded_file = image_path
+                    ok, upload_error = await upload_photo(app_client, target_chat, image_path, cap_pdf)
+                    if ok:
+                        success += 1
+                    else:
+                        failed += 1
+                        await app_client.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ <b>Image upload failed:</b> <code>{safe_title}</code>\n🛑 <code>{upload_error[:300]}</code>"
+                        )
+                else:
+                    failed += 1
+                    await app_client.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ <b>Image download failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
                     )
 
             elif is_pdf:
@@ -696,11 +763,16 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     and is_pdf_file(pdf_path)
                 ):
                     downloaded_file = pdf_path
-                    ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf, thumb_path)
+                    # Telegram document uploads do not need a video thumbnail.
+                    ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf)
                     if ok:
                         success += 1
                     else:
                         failed += 1
+                        await app_client.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ <b>PDF upload failed:</b> <code>{safe_title}</code>\n📄 File downloaded, but Telegram rejected the upload. Check file size/type."
+                        )
                 else:
                     failed += 1
                     await app_client.send_message(
@@ -776,8 +848,9 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"🎉 All Done!"
     )
 
-    if thumb_path and os.path.exists(thumb_path):
-        os.remove(thumb_path)
+    for temporary_asset in (thumb_path, "custom_thumb_optimized.jpg"):
+        if temporary_asset and os.path.exists(temporary_asset):
+            os.remove(temporary_asset)
 
     return True, display_name
 
