@@ -172,16 +172,59 @@ async def smart_sleep(base_delay):
     await asyncio.sleep(total)
 
 
+def _content_type_is_pdf(content_type="", content_disposition=""):
+    """Return True when HTTP metadata identifies a PDF, even without .pdf in URL."""
+    metadata = f"{content_type} {content_disposition}".lower()
+    return "application/pdf" in metadata or "application/x-pdf" in metadata or ".pdf" in metadata
+
+
+async def url_is_pdf(url, headers=None, timeout=30):
+    """Probe a link so extension-less PDF URLs do not enter the video downloader."""
+    try:
+        h = headers or get_utkarsh_headers()
+        response = requests.head(url, headers=h, timeout=timeout, allow_redirects=True)
+        if response.status_code < 400 and _content_type_is_pdf(
+            response.headers.get("Content-Type", ""),
+            response.headers.get("Content-Disposition", ""),
+        ):
+            return True
+        # Some CDNs reject HEAD; a streamed GET still avoids downloading the body.
+        if response.status_code in (403, 405) or not response.headers:
+            response = requests.get(url, headers=h, timeout=timeout, stream=True)
+            is_pdf = _content_type_is_pdf(
+                response.headers.get("Content-Type", ""),
+                response.headers.get("Content-Disposition", ""),
+            )
+            response.close()
+            return is_pdf
+    except Exception as e:
+        print(colored(f"  ⚠️ PDF type probe failed: {e}", "yellow"))
+    return False
+
+
+def is_pdf_file(filepath):
+    """Validate the PDF magic header so an HTML error page is never uploaded as PDF."""
+    try:
+        with open(filepath, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except (OSError, TypeError):
+        return False
+
+
 async def download_file(url, filepath, headers=None, timeout=120):
     try:
         h = headers or get_utkarsh_headers()
         r = requests.get(url, headers=h, timeout=timeout, stream=True)
-        if r.status_code == 200:
-            with open(filepath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            return True
+        if r.status_code != 200:
+            print(colored(f"  ⚠️ Download returned HTTP {r.status_code}: {url}", "yellow"))
+            return False
+        with open(filepath, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            return False
+        return True
     except Exception as e:
         print(colored(f"  ⚠️ Direct download failed: {e}", "yellow"))
     return False
@@ -587,9 +630,14 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     f"📝 Current: <code>{safe_title[:30]}</code>"
                 )
 
-            is_pdf = ".pdf" in url.lower() or "pannel-files" in url
-            is_note = ".ws" in url.lower() or "file_manager/notes" in url
-            is_m3u8 = ".m3u8" in url.lower()
+            normalized_url = requests.utils.unquote(url).lower()
+            is_note = ".ws" in normalized_url or "file_manager/notes" in normalized_url
+            is_pdf = (
+                ".pdf" in normalized_url
+                or "pannel-files" in normalized_url
+                or (not is_note and await url_is_pdf(url))
+            )
+            is_m3u8 = ".m3u8" in normalized_url
 
             cap_vid = f"**[{str(count).zfill(3)}] 🎥 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
             cap_pdf = f"**[{str(count).zfill(3)}] 📁 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
@@ -610,6 +658,10 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                         failed += 1
                 else:
                     failed += 1
+                    await app_client.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ <b>Failed note download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                    )
 
             elif is_pdf:
                 pdf_path = f"{name_prefix}.pdf"
@@ -618,7 +670,11 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     downloaded = await download_with_ytdlp(url, name_prefix, quality)
                     if downloaded:
                         pdf_path = downloaded
-                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+                if (
+                    os.path.exists(pdf_path)
+                    and os.path.getsize(pdf_path) > 1000
+                    and is_pdf_file(pdf_path)
+                ):
                     downloaded_file = pdf_path
                     ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf, thumb_path)
                     if ok:
@@ -627,6 +683,10 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                         failed += 1
                 else:
                     failed += 1
+                    await app_client.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ <b>Failed PDF download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                    )
 
             else:
                 video_path = None
@@ -656,9 +716,21 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             await asyncio.sleep(2)
 
         except Exception as e:
-            print(colored(f"❌ Error processing {link_line}: {e}", "red"))
+            error_text = str(e) or e.__class__.__name__
+            print(colored(f"❌ Error processing {link_line}: {error_text}", "red"))
             failed += 1
             count += 1
+            try:
+                await app_client.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ <b>Error processing file:</b> <code>{safe_title if 'safe_title' in locals() else 'Unknown'}</code>\n"
+                        f"🛑 <code>{error_text[:500]}</code>\n"
+                        f"🔗 <code>{url[:100] if 'url' in locals() else link_line[:100]}</code>"
+                    ),
+                )
+            except Exception as notify_error:
+                print(colored(f"  ⚠️ Could not notify user: {notify_error}", "yellow"))
         finally:
             # EMERGENCY: Always cleanup after each file
             if downloaded_file:
