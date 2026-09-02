@@ -31,25 +31,30 @@ UPDATE_INTERVAL = 15
 EDIT_LOCK = asyncio.Lock()
 
 # ═══════════════════════════════════════════════════════════════
+# RATE LIMITING CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+API_DELAY = 0.5           # Delay between each API call (seconds)
+MAX_CONCURRENT = 3        # Max concurrent API requests
+RATE_LIMIT_RETRY = 300    # Seconds to wait when 429 daily limit hit (5 min)
+
+# ═══════════════════════════════════════════════════════════════
 # NEW API CONFIGURATION (api.asmultiverse.app)
 # ═══════════════════════════════════════════════════════════════
 BASE_URL = "https://api.asmultiverse.app"
 DEVICE_ID = "2cfbaa6be65acdc5"
 
 # Secret key for MadX-Auth-Signature (base64 encoded)
-# Algorithm: HMAC-SHA256(key=base64_decode(SECRET_KEY), msg=timestamp_string)
 SECRET_KEY = "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0="
 
 # Default Bearer token used for the LOGIN endpoint.
-# This token is hardcoded in the Utkarsh app.
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjE0NDQ2MTEzIiwiZGV2aWNlX3R5cGUiOiI0IiwidmVyc2lvbl9jb2RlIjoiMSIsImljciI6IjAiLCJpYXQiOjE3ODgyMzYwOTYsImV4cCI6MTc5MDM5NjA5Nn0.Sn6Ad_klMRf3HJmE81ETHXSIGtSs1r4FyflU_77x3wI"
+
+# Semaphore for concurrent API requests
+api_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 def generate_signature(timestamp: str) -> str:
-    """
-    Generate MadX-Auth-Signature for API requests.
-    Verified against all HAR requests ✅
-    """
+    """Generate MadX-Auth-Signature for API requests."""
     key = base64.b64decode(SECRET_KEY)
     signature = hmac.new(key, timestamp.encode(), hashlib.sha256).digest()
     return base64.b64encode(signature).decode()
@@ -83,34 +88,124 @@ async def api_request(
     json_data=None,
     retries=MAX_RETRIES,
 ):
-    """Make an authenticated API request with exponential back-off."""
-    headers = get_auth_headers(token)
-    url = f"{BASE_URL}{path}"
+    """Make an authenticated API request with rate limiting and retry logic."""
+    async with api_semaphore:
+        headers = get_auth_headers(token)
+        url = f"{BASE_URL}{path}"
 
-    for attempt in range(retries):
-        try:
-            if method == "GET":
-                async with session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
-                ) as resp:
-                    text = await resp.text()
-                    return json.loads(text) if text else {}
-            elif method == "POST":
-                async with session.post(
-                    url,
-                    headers=headers,
-                    json=json_data,
-                    timeout=aiohttp.ClientTimeout(total=TIMEOUT),
-                ) as resp:
-                    text = await resp.text()
-                    return json.loads(text) if text else {}
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            wait = 2 ** attempt
-            print(colored(f"  ⚠️ API retry {attempt + 1}/{retries} after {wait}s: {e}", "yellow"))
-            await asyncio.sleep(wait)
-    return None
+        for attempt in range(retries):
+            try:
+                if method == "GET":
+                    async with session.get(
+                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+                    ) as resp:
+                        text = await resp.text()
+                        data = json.loads(text) if text else {}
+
+                        # Handle rate limiting
+                        if resp.status == 429 or (data.get("status") == 429):
+                            msg = data.get("message", "Rate limit exceeded")
+                            if "daily limit" in msg.lower():
+                                print(colored(f"⚠️ Daily API limit exceeded! Waiting {RATE_LIMIT_RETRY}s...", "red"))
+                                await asyncio.sleep(RATE_LIMIT_RETRY)
+                                continue
+                            else:
+                                wait_time = 2 ** attempt
+                                print(colored(f"⚠️ Rate limited. Waiting {wait_time}s...", "yellow"))
+                                await asyncio.sleep(wait_time)
+                                continue
+
+                        await asyncio.sleep(API_DELAY)
+                        return data
+
+                elif method == "POST":
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=json_data,
+                        timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+                    ) as resp:
+                        text = await resp.text()
+                        data = json.loads(text) if text else {}
+
+                        if resp.status == 429 or (data.get("status") == 429):
+                            msg = data.get("message", "Rate limit exceeded")
+                            if "daily limit" in msg.lower():
+                                print(colored(f"⚠️ Daily API limit exceeded! Waiting {RATE_LIMIT_RETRY}s...", "red"))
+                                await asyncio.sleep(RATE_LIMIT_RETRY)
+                                continue
+                            else:
+                                wait_time = 2 ** attempt
+                                print(colored(f"⚠️ Rate limited. Waiting {wait_time}s...", "yellow"))
+                                await asyncio.sleep(wait_time)
+                                continue
+
+                        await asyncio.sleep(API_DELAY)
+                        return data
+
+            except aiohttp.ClientError as e:
+                if attempt == retries - 1:
+                    raise
+                wait = 2 ** attempt
+                print(colored(f"  ⚠️ Network retry {attempt + 1}/{retries} after {wait}s: {e}", "yellow"))
+                await asyncio.sleep(wait)
+            except Exception as e:
+                if attempt == retries - 1:
+                    raise
+                wait = 2 ** attempt
+                print(colored(f"  ⚠️ API retry {attempt + 1}/{retries} after {wait}s: {e}", "yellow"))
+                await asyncio.sleep(wait)
+
+        return {"success": False, "message": "Max retries exceeded", "status": 500}
+
+
+async def fetch_all_my_batches(session, token):
+    """Fetch ALL pages of my batches (purchased courses)."""
+    all_batches = []
+    page = 1
+    limit = 20
+
+    while True:
+        resp = await api_request(
+            session, token, "GET", 
+            f"/api/v1/utkarsh/batches?page={page}&limit={limit}"
+        )
+
+        if not resp or not resp.get("success"):
+            break
+
+        batches = resp.get("data", [])
+        if not batches:
+            break
+
+        all_batches.extend(batches)
+        print(colored(f"  📄 Page {page}: {len(batches)} batches fetched", "cyan"))
+
+        # If less than limit returned, no more pages
+        if len(batches) < limit:
+            break
+
+        page += 1
+
+        # Safety: max 50 pages
+        if page > 50:
+            print(colored("  ⚠️ Max page limit reached (50)", "yellow"))
+            break
+
+    return all_batches
+
+
+async def search_batches(session, token, keyword):
+    """Search ALL batches by keyword (not just purchased)."""
+    resp = await api_request(
+        session, token, "GET",
+        f"/api/v1/utkarsh/batches/search?search={keyword}"
+    )
+
+    if not resp or not resp.get("success"):
+        return []
+
+    return resp.get("data", [])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -170,30 +265,67 @@ async def handle_utk_logic(app_client, m):
             print(colored(f"❌ Login exception: {e}", "red"))
             return
 
-        # ── 3. Fetch batch list ────────────────────────────────
-        await editable.edit("📚 Fetching your batches...")
-        try:
-            batches_resp = await api_request(
-                session, token, "GET", "/api/v1/utkarsh/batches?page=1&limit=100"
+        # ── 3. Ask user: My Batches or Search ──────────────────
+        choice_msg = await m.reply_text(
+            "📋 <b>Choose an option:</b>\n\n"
+            "1️⃣ <b>My Batches</b> — Show all your purchased batches\n"
+            "2️⃣ <b>Search Batches</b> — Search any batch by name (e.g., REET, RAS, etc.)\n\n"
+            "Reply with <code>1</code> or <code>2</code>"
+        )
+
+        input_choice = await app_client.listen(chat_id=m.chat.id)
+        choice = input_choice.text.strip()
+        await input_choice.delete()
+        await choice_msg.delete()
+
+        batches = []
+        search_keyword = ""
+
+        if choice == "2":
+            # ── SEARCH MODE ──────────────────────────────────
+            search_msg = await m.reply_text(
+                "🔍 <b>Enter search keyword:</b>\n"
+                "Examples: <code>REET</code>, <code>RAS</code>, <code>Patwari</code>, <code>Police</code>"
             )
-            if not batches_resp or not batches_resp.get("success"):
-                await editable.edit("❌ Failed to fetch batches from API.")
+            input_search = await app_client.listen(chat_id=m.chat.id)
+            search_keyword = input_search.text.strip()
+            await input_search.delete()
+            await search_msg.delete()
+
+            await editable.edit(f"🔍 Searching batches for "<code>{search_keyword}</code>"...")
+
+            try:
+                batches = await search_batches(session, token, search_keyword)
+                if not batches:
+                    await editable.edit(
+                        f"❌ No batches found for "<code>{search_keyword}</code>".\n"
+                        f"Try a different keyword."
+                    )
+                    return
+            except Exception as e:
+                await editable.edit(f"❌ Search error: {str(e)}")
                 return
 
-            batches = batches_resp.get("data", [])
-            if not batches:
-                await editable.edit("❌ No batches found in your account.")
+        else:
+            # ── MY BATCHES MODE ──────────────────────────────
+            await editable.edit("📚 Fetching all your batches...")
+            try:
+                batches = await fetch_all_my_batches(session, token)
+                if not batches:
+                    await editable.edit("❌ No batches found in your account.")
+                    return
+            except Exception as e:
+                await editable.edit(f"❌ Error fetching batches: {str(e)}")
                 return
-        except Exception as e:
-            await editable.edit(f"❌ Error fetching batches: {str(e)}")
-            return
 
         # ── 4. Show batches to user ────────────────────────────
         cool = ""
         FFF = "🔸 <b>BATCH INFORMATION</b> 🔸"
         Batch_ids = ""
 
-        print(colored(f"📚 Found {len(batches)} batches:", "cyan"))
+        mode_text = f"Search: "<code>{search_keyword}</code>"" if search_keyword else "My Batches"
+
+        print(colored(f"📚 {mode_text} — Found {len(batches)} batches:", "cyan"))
         for item in batches:
             bid = item.get("_id")
             title = item.get("title")
@@ -207,10 +339,10 @@ async def handle_utk_logic(app_client, m):
 
         login_msg = f"<b>✅ {appname} Login Successful</b>\n"
         login_msg += f"\n<b>🆔 Credentials:</b> <code>{raw_text}</code>\n\n"
-        login_msg += f"\n\n<b>📚 Available Batches</b>\n\n{cool}"
+        login_msg += f"\n<b>📚 {mode_text}</b> — <b>{len(batches)} batches found</b>\n\n{cool}"
 
         await app_client.send_message(txt_dump, login_msg)
-        await editable.edit(f"{FFF}\n\n{cool}")
+        await editable.edit(f"{FFF}\n\n<b>{mode_text}</b> — {len(batches)} batches\n\n{cool}")
 
         # ── 5. Ask for batch ID ────────────────────────────────
         editable1 = await m.reply_text(
@@ -240,6 +372,16 @@ async def handle_utk_logic(app_client, m):
                 batch_details = await api_request(
                     session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/details"
                 )
+
+                if batch_details.get("status") == 429:
+                    msg = batch_details.get("message", "Daily limit exceeded")
+                    await progress_msg.edit(
+                        f"⏳ <b>API Rate Limit</b>\n\n"
+                        f"{msg}\n\n"
+                        f"Please try again after some time."
+                    )
+                    continue
+
                 if not batch_details or not batch_details.get("success"):
                     await progress_msg.edit(
                         f"❌ Batch ID <code>{batch_id}</code> not found!"
@@ -272,6 +414,10 @@ async def handle_utk_logic(app_client, m):
                         "GET",
                         f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/details",
                     )
+
+                    if subjects_resp.get("status") == 429:
+                        print(colored("⚠️ Rate limit during subjects fetch, skipping...", "yellow"))
+                        continue
                     if not subjects_resp or not subjects_resp.get("success"):
                         continue
                     subjects = subjects_resp.get("data", [])
@@ -290,6 +436,10 @@ async def handle_utk_logic(app_client, m):
                             "GET",
                             f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/details",
                         )
+
+                        if topics_resp.get("status") == 429:
+                            print(colored("⚠️ Rate limit during topics fetch, skipping...", "yellow"))
+                            continue
                         if not topics_resp or not topics_resp.get("success"):
                             continue
                         topics = topics_resp.get("data", [])
@@ -304,6 +454,10 @@ async def handle_utk_logic(app_client, m):
                                 "GET",
                                 f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details",
                             )
+
+                            if contents_resp.get("status") == 429:
+                                print(colored("⚠️ Rate limit during contents fetch, skipping...", "yellow"))
+                                continue
                             if not contents_resp or not contents_resp.get("success"):
                                 continue
                             contents = contents_resp.get("data", [])
@@ -319,6 +473,10 @@ async def handle_utk_logic(app_client, m):
                                     "GET",
                                     f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
                                 )
+
+                                if detail_resp.get("status") == 429:
+                                    print(colored("⚠️ Rate limit during link fetch, skipping...", "yellow"))
+                                    continue
                                 if not detail_resp or not detail_resp.get("success"):
                                     continue
 
@@ -371,7 +529,7 @@ async def handle_utk_logic(app_client, m):
 
 
 # ═══════════════════════════════════════════════════════════════
-# FILE CREATION & SENDING (unchanged from original)
+# FILE CREATION & SENDING
 # ═══════════════════════════════════════════════════════════════
 async def login(
     app,
