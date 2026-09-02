@@ -144,6 +144,16 @@ async def get_folder_size():
         return 0
 
 
+def get_asset_headers():
+    """Headers accepted by Utkarsh S3 assets (images/PDFs/video files)."""
+    return {
+        "User-Agent": "okhttp/3.9.1",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+        "Connection": "keep-alive",
+    }
+
+
 def get_utkarsh_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -181,7 +191,7 @@ def _content_type_is_pdf(content_type="", content_disposition=""):
 async def url_is_pdf(url, headers=None, timeout=30):
     """Probe a link so extension-less PDF URLs do not enter the video downloader."""
     try:
-        h = headers or get_utkarsh_headers()
+        h = headers or get_asset_headers()
         response = requests.head(url, headers=h, timeout=timeout, allow_redirects=True)
         if response.status_code < 400 and _content_type_is_pdf(
             response.headers.get("Content-Type", ""),
@@ -213,7 +223,7 @@ def is_pdf_file(filepath):
 
 async def download_file(url, filepath, headers=None, timeout=120):
     try:
-        h = headers or get_utkarsh_headers()
+        h = headers or get_asset_headers()
         r = requests.get(url, headers=h, timeout=timeout, stream=True)
         if r.status_code != 200:
             print(colored(f"  ⚠️ Download returned HTTP {r.status_code}: {url}", "yellow"))
@@ -231,7 +241,7 @@ async def download_file(url, filepath, headers=None, timeout=120):
 
 
 async def download_with_ytdlp(url, output_name, quality="720"):
-    header_args = '--add-header "Referer:https://utkarshapp.com/" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"'
+    header_args = '--add-header "User-Agent:okhttp/3.9.1" --add-header "Accept:*/*" --add-header "Accept-Encoding:gzip"'
     if ".pdf" in url.lower():
         cmd = f'yt-dlp {header_args} -o "{output_name}.pdf" "{url}" -R 25 --fragment-retries 25'
     elif ".m3u8" in url.lower() or "jw" in url.lower():
@@ -525,10 +535,20 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     if thumb_url.startswith("http"):
         thumb_path = "custom_thumb.jpg"
         try:
-            r = requests.get(thumb_url)
+            r = requests.get(
+                thumb_url,
+                headers=get_asset_headers(),
+                timeout=30,
+                allow_redirects=True,
+            )
+            r.raise_for_status()
+            if not r.content or not r.headers.get("Content-Type", "").lower().startswith("image/"):
+                raise ValueError("thumbnail URL did not return an image")
             with open(thumb_path, "wb") as f:
                 f.write(r.content)
-        except:
+            print(colored(f"  ✅ Thumbnail downloaded: {len(r.content)} bytes", "green"))
+        except Exception as e:
+            print(colored(f"  ⚠️ Thumbnail download failed: {e}; using video frame", "yellow"))
             thumb_path = None
 
     # Resume check
@@ -645,7 +665,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
 
             if is_note:
                 note_path = f"{name_prefix}.txt"
-                headers = get_utkarsh_headers()
+                headers = get_asset_headers()
                 r = requests.get(url, headers=headers, timeout=30)
                 if r.status_code == 200:
                     with open(note_path, "w", encoding="utf-8") as f:
