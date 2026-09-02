@@ -7,13 +7,16 @@ WORKDIR /app
 # Install system dependencies (if needed, can be removed if not using any OS deps)
 RUN apt-get update && apt-get install -y \
     build-essential \
+    ffmpeg \
+    aria2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements (if you use one)
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies. yt-dlp is Python-installed, while ffmpeg/aria2
+# above are OS binaries required by the video downloader.
+RUN pip install --no-cache-dir -r requirements.txt yt-dlp
 
 # Copy your code
 COPY . .
