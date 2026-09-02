@@ -10,6 +10,7 @@ import json
 import hmac
 import hashlib
 import random
+import glob
 from pyrogram import filters
 from Extractor import app
 from config import CHANNEL_ID, THUMB_URL
@@ -32,9 +33,6 @@ UPDATE_DELAY = 5
 UPDATE_INTERVAL = 15
 EDIT_LOCK = asyncio.Lock()
 
-# ═══════════════════════════════════════════════════════════════
-# ANTI-RATE-LIMIT CONFIGURATION
-# ═══════════════════════════════════════════════════════════════
 API_DELAY = 2.5
 MAX_CONCURRENT = 1
 RATE_LIMIT_RETRY = 600
@@ -45,15 +43,9 @@ CONTENT_PAUSE = 2
 JITTER_MIN = 1
 JITTER_MAX = 4
 
-# ═══════════════════════════════════════════════════════════════
-# RESUME / STATE CONFIGURATION
-# ═══════════════════════════════════════════════════════════════
 STATE_FILE = "./bot_state.json"
 UPLOAD_STATE_FILE = "./upload_state.json"
 
-# ═══════════════════════════════════════════════════════════════
-# NEW API CONFIGURATION
-# ═══════════════════════════════════════════════════════════════
 BASE_URL = "https://api.asmultiverse.app"
 DEVICE_ID = "2cfbaa6be65acdc5"
 SECRET_KEY = "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0="
@@ -64,9 +56,7 @@ api_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════════
-# STATE MANAGEMENT (RESUME SUPPORT)
-# ═══════════════════════════════════════════════════════════════
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -105,8 +95,55 @@ def clear_state():
 
 
 # ═══════════════════════════════════════════════════════════════
-# HELPERS
+# STORAGE CLEANUP FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
+async def cleanup_file(filepath):
+    """Delete file and all related temp files immediately"""
+    if not filepath:
+        return
+    try:
+        # Delete main file
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            print(colored(f"  🗑️ Deleted: {os.path.basename(filepath)}", "green"))
+
+        # Delete all related temp files
+        base = os.path.splitext(filepath)[0]
+        for ext in ['.jpg', '.part', '.ytdl', '.mp4', '.mkv', '.webm', '.pdf', '.txt', '.mp4.part', '.webm.part']:
+            temp = base + ext
+            if os.path.exists(temp):
+                os.remove(temp)
+                print(colored(f"  🗑️ Deleted temp: {os.path.basename(temp)}", "green"))
+    except Exception as e:
+        print(colored(f"  ⚠️ Cleanup error: {e}", "yellow"))
+
+
+async def purge_downloads_folder():
+    """Emergency: Delete everything in downloads folder"""
+    try:
+        files = glob.glob(f"{DOWNLOAD_DIR}/*")
+        for f in files:
+            if os.path.isfile(f):
+                os.remove(f)
+        print(colored(f"🗑️ Purged {len(files)} files from downloads/", "green"))
+    except Exception as e:
+        print(colored(f"⚠️ Purge error: {e}", "yellow"))
+
+
+async def get_folder_size():
+    """Get current downloads folder size in MB"""
+    try:
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(DOWNLOAD_DIR):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                if os.path.exists(fp):
+                    total += os.path.getsize(fp)
+        return total / (1024 * 1024)
+    except:
+        return 0
+
+
 def get_utkarsh_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -191,7 +228,11 @@ async def get_video_duration(filepath):
         return 0
 
 
+# ═══════════════════════════════════════════════════════════════
+# UPLOAD WITH GUARANTEED CLEANUP
+# ═══════════════════════════════════════════════════════════════
 async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, duration=0):
+    downloaded_path = filepath
     try:
         if not os.path.exists(filepath):
             return False
@@ -210,10 +251,6 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
             width=1280,
             height=720,
         )
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        if os.path.exists(f"{filepath}.jpg"):
-            os.remove(f"{filepath}.jpg")
         return True
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -221,9 +258,15 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
     except Exception as e:
         print(colored(f"  ❌ Upload video error: {e}", "red"))
         return False
+    finally:
+        # ALWAYS cleanup, even if upload fails
+        await cleanup_file(downloaded_path)
+        if thumb_path and thumb_path != "custom_thumb.jpg":
+            await cleanup_file(thumb_path)
 
 
 async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=None):
+    downloaded_path = filepath
     try:
         if not os.path.exists(filepath):
             return False
@@ -233,8 +276,6 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
             caption=caption,
             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
         )
-        if os.path.exists(filepath):
-            os.remove(filepath)
         return True
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -242,11 +283,11 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
     except Exception as e:
         print(colored(f"  ❌ Upload doc error: {e}", "red"))
         return False
+    finally:
+        # ALWAYS cleanup
+        await cleanup_file(downloaded_path)
 
 
-# ═══════════════════════════════════════════════════════════════
-# UTKARSH API FUNCTIONS
-# ═══════════════════════════════════════════════════════════════
 def generate_signature(timestamp: str) -> str:
     key = base64.b64decode(SECRET_KEY)
     signature = hmac.new(key, timestamp.encode(), hashlib.sha256).digest()
@@ -371,12 +412,11 @@ async def search_batches(session, token, keyword):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SHARED UPLOAD FLOW (Used by both /utkarsh and /upload)
+# SHARED UPLOAD FLOW
 # ═══════════════════════════════════════════════════════════════
 async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     chat_id = m.chat.id
 
-    # Ask upload destination
     dest_msg = await m.reply_text(
         "📤 <b>Where do you want to upload?</b>\n\n"
         "1️⃣ <b>This Chat</b> — Upload here\n"
@@ -409,7 +449,6 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             await m.reply_text(f"❌ Failed to access channel!\nError: {str(e)}\n\nMake sure bot is ADMIN in that channel.")
             return False, None
 
-    # Ask batch display name
     config_msg = await m.reply_text(
         "⚙️ <b>Upload Configuration</b>\n\n"
         "Send batch display name (ye naam har file ke caption mein ayega):"
@@ -419,7 +458,6 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     await name_input.delete()
     await config_msg.delete()
 
-    # Ask quality
     qual_msg = await m.reply_text(
         "🎥 <b>Select Video Quality:</b>\n\n"
         "<code>144</code> | <code>240</code> | <code>360</code> | <code>480</code> | <code>720</code> | <code>1080</code>\n\n"
@@ -432,7 +470,6 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     if quality not in ["144", "240", "360", "480", "720", "1080"]:
         quality = "720"
 
-    # Ask thumbnail
     thumb_msg = await m.reply_text(
         "🖼 <b>Send Thumbnail URL</b> (or send <code>no</code> to skip):"
     )
@@ -451,9 +488,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         except:
             thumb_path = None
 
-    # ═══════════════════════════════════════════════════
-    # RESUME CHECK
-    # ═══════════════════════════════════════════════════
+    # Resume check
     state_key = f"{chat_id}_{source}_{bname}"
     upload_state = load_upload_state()
     resume_index = 0
@@ -500,9 +535,6 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         resume_success = 0
         resume_failed = 0
 
-    # ═══════════════════════════════════════════════════
-    # START DOWNLOAD & UPLOAD
-    # ═══════════════════════════════════════════════════
     start_msg = await m.reply_text(
         f"🚀 <b>Starting Upload!</b>\n\n"
         f"📍 Target: <code>{target_chat}</code>\n"
@@ -519,6 +551,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
 
     for idx in range(resume_index, len(all_urls)):
         link_line = all_urls[idx]
+        downloaded_file = None
         try:
             if ": " in link_line:
                 title, url = link_line.split(": ", 1)
@@ -529,7 +562,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             safe_title = sanitize_name(title)
             name_prefix = f"{DOWNLOAD_DIR}/{str(count).zfill(3)})_{safe_title}"
 
-            # Save progress every file
+            # Save progress
             upload_state[state_key] = {
                 "last_index": idx,
                 "count": count,
@@ -541,13 +574,16 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             }
             save_upload_state(upload_state)
 
-            if count % 3 == 0:
+            # Show storage status every 5 files
+            if count % 5 == 0:
+                size_mb = await get_folder_size()
                 await safe_edit_message(
                     start_msg,
                     f"⏳ <b>Uploading...</b>\n\n"
                     f"✅ Done: {success}\n"
                     f"❌ Failed: {failed}\n"
                     f"📊 Total: {count}/{len(all_urls)}\n"
+                    f"💾 Storage: <code>{size_mb:.1f} MB</code>\n"
                     f"📝 Current: <code>{safe_title[:30]}</code>"
                 )
 
@@ -566,6 +602,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                 if r.status_code == 200:
                     with open(note_path, "w", encoding="utf-8") as f:
                         f.write(r.text)
+                    downloaded_file = note_path
                     ok = await upload_document(app_client, target_chat, note_path, cap_note)
                     if ok:
                         success += 1
@@ -582,6 +619,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     if downloaded:
                         pdf_path = downloaded
                 if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+                    downloaded_file = pdf_path
                     ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf, thumb_path)
                     if ok:
                         success += 1
@@ -601,6 +639,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     if ok:
                         video_path = test_path
                 if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 10000:
+                    downloaded_file = video_path
                     ok = await upload_video(app_client, target_chat, video_path, cap_vid, thumb_path)
                     if ok:
                         success += 1
@@ -620,11 +659,18 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             print(colored(f"❌ Error processing {link_line}: {e}", "red"))
             failed += 1
             count += 1
-            continue
+        finally:
+            # EMERGENCY: Always cleanup after each file
+            if downloaded_file:
+                await cleanup_file(downloaded_file)
+            # Also purge any stray files in downloads every 10 files
+            if count % 10 == 0:
+                await purge_downloads_folder()
 
-    # Clear state on completion
+    # Final cleanup
     upload_state.pop(state_key, None)
     save_upload_state(upload_state)
+    await purge_downloads_folder()
 
     await safe_edit_message(
         start_msg,
@@ -633,7 +679,8 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"📍 Target: <code>{target_chat}</code>\n"
         f"✅ Success: <code>{success}</code>\n"
         f"❌ Failed: <code>{failed}</code>\n"
-        f"📁 Total: <code>{len(all_urls)}</code>\n\n"
+        f"📁 Total: <code>{len(all_urls)}</code>\n"
+        f"💾 Storage: <code>0 MB</code> (cleaned)\n\n"
         f"🎉 All Done!"
     )
 
@@ -685,10 +732,7 @@ async def upload_from_txt_handler(app_client, m):
     await asyncio.sleep(2)
     await editable.delete()
 
-    # Detect batch name from file
     bname = input_file.document.file_name.replace(".txt", "").replace("_", " ")
-
-    # Start upload flow
     ok, display_name = await upload_flow(app_client, m, lines, bname, source="upload")
 
     if ok:
@@ -705,7 +749,6 @@ async def handle_utk_logic(app_client, m):
     start_time = time.time()
     chat_id = m.chat.id
 
-    # Check for existing state (resume extraction)
     state = load_state()
     resume_key = str(chat_id)
 
@@ -726,10 +769,8 @@ async def handle_utk_logic(app_client, m):
         if choice == "resume":
             all_urls = resume_data.get("urls", [])
             bname = resume_data.get("bname", "Unknown")
-            token = resume_data.get("token", "")
             batch_id = resume_data.get("batch_id", "")
 
-            # Save to file and send
             safe_bname = sanitize_name(bname)
             file_path = f"{safe_bname}.txt"
             with open(file_path, "w", encoding="utf-8") as f:
@@ -737,11 +778,9 @@ async def handle_utk_logic(app_client, m):
             await m.reply_document(document=file_path, caption=f"✅ <b>{bname}</b>\n📁 Total Links: {len(all_urls)}")
             os.remove(file_path)
 
-            # Clear extraction state
             state.pop(resume_key, None)
             save_state(state)
 
-            # Start upload flow
             ok, display_name = await upload_flow(app_client, m, all_urls, bname, source="extractor")
             if ok:
                 await m.reply_text(f"✅ <b>All Done!</b>\n📚 Batch: <b>{display_name}</b>")
@@ -750,11 +789,10 @@ async def handle_utk_logic(app_client, m):
             state.pop(resume_key, None)
             save_state(state)
 
-    # Fresh start
     editable = await m.reply_text(
-        "🔹 <b>UTK EXTRACTOR PRO (Anti-Rate-Limit v3 + Resume)</b>\n\n"
+        "🔹 <b>UTK EXTRACTOR PRO (Storage-Safe + Resume)</b>\n\n"
         "Send **ID & Password** in this format: <code>ID*Password</code>\n\n"
-        "⚠️ <i>If rate limited, bot will auto-save progress and resume later!</i>"
+        "⚠️ <i>Files auto-delete after upload. Zero storage used!</i>"
     )
 
     input1 = await app_client.listen(chat_id=chat_id)
@@ -900,7 +938,6 @@ async def handle_utk_logic(app_client, m):
                 all_urls = []
                 total_links = 0
 
-                # Initialize state for resume
                 state[resume_key] = {
                     "extracting": True,
                     "bname": bname,
@@ -996,7 +1033,6 @@ async def handle_utk_logic(app_client, m):
                                             f"├─ Links found: {total_links}\n"
                                             f"└─ Current: <code>{safe_title[:40]}...</code>"
                                         )
-                                    # Save state periodically
                                     state[resume_key]["urls"] = all_urls
                                     save_state(state)
                                 await smart_sleep(1)
@@ -1009,7 +1045,6 @@ async def handle_utk_logic(app_client, m):
 
                 print(colored(f"✅ Extracted {len(all_urls)} URLs from {bname}", "green"))
 
-                # Clear extraction state
                 state.pop(resume_key, None)
                 save_state(state)
 
@@ -1021,7 +1056,6 @@ async def handle_utk_logic(app_client, m):
                 await m.reply_document(document=file_path, caption=f"✅ <b>{bname}</b>\n📁 Total Links: {len(all_urls)}")
                 os.remove(file_path)
 
-                # Start upload flow
                 ok, display_name = await upload_flow(app_client, m, all_urls, bname, source="extractor")
                 if ok:
                     await m.reply_text(f"✅ <b>All Done!</b>\n📚 Batch: <b>{display_name}</b>")
@@ -1035,7 +1069,7 @@ async def handle_utk_logic(app_client, m):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMAND: /clearstate (Admin only - clear resume states)
+# COMMAND: /clearstate
 # ═══════════════════════════════════════════════════════════════
 @app.on_message(filters.command(["clearstate"]))
 async def clear_state_handler(app_client, m):
