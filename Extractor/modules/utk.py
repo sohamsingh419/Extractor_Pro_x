@@ -46,6 +46,10 @@ JITTER_MAX = 4
 STATE_FILE = "./bot_state.json"
 UPLOAD_STATE_FILE = "./upload_state.json"
 
+# One interactive upload per chat. Commands below control the active job
+# without interrupting a file that is already being downloaded/uploaded.
+ACTIVE_UPLOADS = {}
+
 BASE_URL = "https://api.asmultiverse.app"
 DEVICE_ID = "2cfbaa6be65acdc5"
 SECRET_KEY = "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0="
@@ -177,6 +181,24 @@ def sanitize_name(name, max_length=55):
     if len(name) > max_length:
         name = name[:max_length]
     return name or "Unknown"
+
+
+def build_caption(index, icon, title, display_name, footer=""):
+    """Build captions as literal text; never let titles become Telegram spoilers."""
+    caption = f"[{str(index).zfill(3)}] {icon} {title}\n📚 Batch: {display_name}"
+    if footer.strip():
+        caption += f"\n{footer.strip()}"
+    return caption
+
+
+async def wait_for_upload_command(chat_id):
+    """Wait while paused and return True when the batch was permanently stopped."""
+    control = ACTIVE_UPLOADS.get(chat_id)
+    if not control:
+        return False
+    while control["paused"].is_set() and not control["fullstop"]:
+        await asyncio.sleep(1)
+    return control["fullstop"]
 
 
 async def smart_sleep(base_delay):
@@ -400,6 +422,7 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
             thumb=thumb_path if os.path.exists(thumb_path) else None,
             width=1280,
             height=720,
+            parse_mode=None,
         )
         return True
     except FloodWait as e:
@@ -420,7 +443,7 @@ async def upload_photo(bot_client, chat_id, filepath, caption):
     try:
         if not os.path.exists(filepath):
             return False, "downloaded image file is missing"
-        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption)
+        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption, parse_mode=None)
         return True, ""
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -442,6 +465,7 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
             document=filepath,
             caption=caption,
             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+            parse_mode=None,
         )
         return True
     except FloodWait as e:
@@ -458,7 +482,7 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
 async def upload_document_from_url(bot_client, chat_id, url, caption):
     """Let Telegram fetch a public document when the Koyeb egress IP is blocked."""
     try:
-        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption)
+        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption, parse_mode=None)
         return True, ""
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -594,6 +618,43 @@ async def search_batches(session, token, keyword):
 # ═══════════════════════════════════════════════════════════════
 # SHARED UPLOAD FLOW
 # ═══════════════════════════════════════════════════════════════
+@app.on_message(filters.command(["pause", "stop"]))
+async def pause_upload_handler(app_client, m):
+    control = ACTIVE_UPLOADS.get(m.chat.id)
+    if not control:
+        await m.reply_text("ℹ️ Is chat me koi active upload nahi hai.")
+        return
+    control["paused"].set()
+    await m.reply_text("⏸️ Upload pause kar diya gaya. Current file ke baad rukega. Resume ke liye /resume bheje.")
+
+
+@app.on_message(filters.command(["resume"]))
+async def resume_upload_handler(app_client, m):
+    control = ACTIVE_UPLOADS.get(m.chat.id)
+    if not control:
+        await m.reply_text("ℹ️ Resume karne ke liye saved upload state nahi mili. Batch dobara start karein.")
+        return
+    if control["fullstop"]:
+        await m.reply_text("🚫 Ye batch /fullstop se permanently cancel ho chuka hai; resume nahi hoga.")
+        return
+    control["paused"].clear()
+    await m.reply_text("▶️ Upload resume kar diya gaya.")
+
+
+@app.on_message(filters.command(["fullstop"]))
+async def fullstop_upload_handler(app_client, m):
+    control = ACTIVE_UPLOADS.get(m.chat.id)
+    if not control:
+        await m.reply_text("ℹ️ Is chat me koi active upload nahi hai.")
+        return
+    control["fullstop"] = True
+    control["paused"].clear()
+    upload_state = load_upload_state()
+    upload_state.pop(control["state_key"], None)
+    save_upload_state(upload_state)
+    await m.reply_text("🛑 Batch permanently stop kar diya gaya. Is batch ko resume nahi kiya ja sakta.")
+
+
 async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     chat_id = m.chat.id
 
@@ -649,6 +710,18 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     await qual_msg.delete()
     if quality not in ["144", "240", "360", "480", "720", "1080"]:
         quality = "720"
+
+    caption_msg = await m.reply_text(
+        "✍️ <b>Caption footer bheje</b>\n\n"
+        "Ye text har video/PDF/file ke caption ke last me aayega.\n"
+        "Default me koi footer nahi hoga. Footer nahi chahiye to <code>no</code> bheje:"
+    )
+    caption_input = await app_client.listen(chat_id=chat_id)
+    caption_footer = caption_input.text.strip()
+    await caption_input.delete()
+    await caption_msg.delete()
+    if caption_footer.lower() in {"no", "none", "skip", "-"}:
+        caption_footer = ""
 
     thumb_msg = await m.reply_text(
         "🖼 <b>Send Thumbnail URL</b> (or send <code>no</code> to skip):"
@@ -756,8 +829,16 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     count = resume_count
     failed = resume_failed
     success = resume_success
+    control = {"paused": asyncio.Event(), "fullstop": False, "state_key": state_key}
+    ACTIVE_UPLOADS[chat_id] = control
 
-    for idx in range(resume_index, len(all_urls)):
+    try:
+        for idx in range(resume_index, len(all_urls)):
+            if await wait_for_upload_command(chat_id):
+                upload_state.pop(state_key, None)
+                save_upload_state(upload_state)
+                await safe_edit_message(start_msg, "🛑 <b>Batch permanently stopped.</b>\nResume state deleted.")
+                return False, display_name
         link_line = all_urls[idx]
         downloaded_file = None
         try:
