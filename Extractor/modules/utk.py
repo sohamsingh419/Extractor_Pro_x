@@ -455,6 +455,19 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
         await cleanup_file(downloaded_path)
 
 
+async def upload_document_from_url(bot_client, chat_id, url, caption):
+    """Let Telegram fetch a public document when the Koyeb egress IP is blocked."""
+    try:
+        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption)
+        return True, ""
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await upload_document_from_url(bot_client, chat_id, url, caption)
+    except Exception as e:
+        print(colored(f"  ❌ Telegram URL upload error: {e}", "red"))
+        return False, str(e)
+
+
 def generate_signature(timestamp: str) -> str:
     key = base64.b64decode(SECRET_KEY)
     signature = hmac.new(key, timestamp.encode(), hashlib.sha256).digest()
@@ -846,6 +859,23 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                 pdf_path = f"{name_prefix}.pdf"
                 ok = await download_file(url, pdf_path)
                 if not ok:
+                    # Koyeb's egress IP can be blocked while Telegram's
+                    # media network can still fetch the same public object.
+                    url_ok, url_error = await upload_document_from_url(
+                        app_client, target_chat, url, cap_pdf
+                    )
+                    if url_ok:
+                        success += 1
+                        count += 1
+                        upload_state[state_key].update({
+                            "last_index": idx + 1,
+                            "count": count,
+                            "success": success,
+                            "failed": failed,
+                        })
+                        save_upload_state(upload_state)
+                        await asyncio.sleep(2)
+                        continue
                     downloaded = await download_with_ytdlp(url, name_prefix, quality)
                     if downloaded:
                         pdf_path = downloaded
@@ -863,7 +893,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                         failed += 1
                         await app_client.send_message(
                             chat_id=chat_id,
-                            text=f"❌ <b>PDF upload failed:</b> <code>{safe_title}</code>\n📄 File downloaded, but Telegram rejected the upload. Check file size/type."
+                            text=f"❌ <b>PDF upload failed:</b> <code>{safe_title}</code>\n📄 Direct CDN download and Telegram URL fallback both failed.\n🛑 <code>{url_error[:300] if 'url_error' in locals() and url_error else 'Check source CDN access.'}</code>"
                         )
                 else:
                     failed += 1
