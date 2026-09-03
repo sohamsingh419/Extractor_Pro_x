@@ -832,13 +832,13 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     control = {"paused": asyncio.Event(), "fullstop": False, "state_key": state_key}
     ACTIVE_UPLOADS[chat_id] = control
 
-    try:
-        for idx in range(resume_index, len(all_urls)):
-            if await wait_for_upload_command(chat_id):
-                upload_state.pop(state_key, None)
-                save_upload_state(upload_state)
-                await safe_edit_message(start_msg, "🛑 <b>Batch permanently stopped.</b>\nResume state deleted.")
-                return False, display_name
+    for idx in range(resume_index, len(all_urls)):
+        if await wait_for_upload_command(chat_id):
+            upload_state.pop(state_key, None)
+            save_upload_state(upload_state)
+            ACTIVE_UPLOADS.pop(chat_id, None)
+            await safe_edit_message(start_msg, "🛑 <b>Batch permanently stopped.</b>\nResume state deleted.")
+            return False, display_name
         link_line = all_urls[idx]
         downloaded_file = None
         try:
@@ -859,6 +859,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                 "failed": failed,
                 "batch_name": display_name,
                 "target_chat": str(target_chat),
+                "caption_footer": caption_footer,
                 "timestamp": time.time()
             }
             save_upload_state(upload_state)
@@ -887,9 +888,9 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             )
             is_m3u8 = ".m3u8" in normalized_url
 
-            cap_vid = f"**[{str(count).zfill(3)}] 🎥 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
-            cap_pdf = f"**[{str(count).zfill(3)}] 📁 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
-            cap_note = f"**[{str(count).zfill(3)}] 📝 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
+            cap_vid = build_caption(count, "🎥", title, display_name, caption_footer)
+            cap_pdf = build_caption(count, "📁", title, display_name, caption_footer)
+            cap_note = build_caption(count, "📝", title, display_name, caption_footer)
 
             if is_note:
                 note_path = f"{name_prefix}.txt"
@@ -1008,6 +1009,13 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     )
 
             count += 1
+            upload_state[state_key].update({
+                "last_index": idx + 1,
+                "count": count,
+                "success": success,
+                "failed": failed,
+            })
+            save_upload_state(upload_state)
             await asyncio.sleep(2)
 
         except Exception as e:
@@ -1015,6 +1023,14 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             print(colored(f"❌ Error processing {link_line}: {error_text}", "red"))
             failed += 1
             count += 1
+            if state_key in upload_state:
+                upload_state[state_key].update({
+                    "last_index": idx + 1,
+                    "count": count,
+                    "success": success,
+                    "failed": failed,
+                })
+                save_upload_state(upload_state)
             try:
                 await app_client.send_message(
                     chat_id=chat_id,
@@ -1055,6 +1071,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         if temporary_asset and os.path.exists(temporary_asset):
             os.remove(temporary_asset)
 
+    ACTIVE_UPLOADS.pop(chat_id, None)
     return True, display_name
 
 
