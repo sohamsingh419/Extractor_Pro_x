@@ -149,7 +149,9 @@ def get_asset_headers():
     return {
         "User-Agent": "okhttp/3.9.1",
         "Accept": "*/*",
-        "Accept-Encoding": "gzip",
+        # Do not ask for compressed bytes: a PDF must be written exactly as
+        # received and some CDN proxies close compressed long-lived streams.
+        "Accept-Encoding": "identity",
         "Connection": "keep-alive",
     }
 
@@ -161,6 +163,7 @@ def get_utkarsh_headers():
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://utkarshapp.com/",
         "Origin": "https://utkarshapp.com",
+        "Accept-Encoding": "identity",
         "Connection": "keep-alive",
     }
 
@@ -222,25 +225,114 @@ def is_pdf_file(filepath):
 
 
 async def download_file(url, filepath, headers=None, timeout=120):
+    """Download an asset safely from S3/CloudFront.
+
+    Koyeb instances can see a transient CDN 403 or a connection that closes
+    before a large PDF is complete.  This function first tries a normal
+    streamed GET, then resumes the missing bytes with HTTP Range requests.
+    Every response is checked and data is written to a .part file, so an HTML
+    error page or truncated PDF can never be handed to Telegram.
+    """
+    return await asyncio.to_thread(
+        _download_file_sync, url, filepath, headers, timeout
+    )
+
+
+def _download_file_sync(url, filepath, headers=None, timeout=120):
     last_error = "unknown download error"
     header_sets = [headers or get_asset_headers(), get_utkarsh_headers()]
-    for h in header_sets:
-        try:
-            r = requests.get(url, headers=h, timeout=timeout, stream=True, allow_redirects=True)
-            if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}"
-                r.close()
-                continue
-            with open(filepath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            r.close()
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                return True
-            last_error = "empty response"
-        except Exception as e:
-            last_error = str(e)
+    part_path = f"{filepath}.part"
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+
+    for header_index, base_headers in enumerate(header_sets):
+        h = dict(base_headers)
+        h["Accept-Encoding"] = "identity"
+        request_urls = [url]
+        # Refresh a transient cached CloudFront 403 once; this preserves the
+        # original object path and does not bypass authentication or use a proxy.
+        if header_index == len(header_sets) - 1:
+            separator = "&" if "?" in url else "?"
+            request_urls.append(f"{url}{separator}_download_retry={int(time.time())}")
+        for request_url in request_urls:
+            try:
+                with requests.Session() as session:
+                    response = session.get(
+                        request_url,
+                        headers=h,
+                        timeout=(15, timeout),
+                        stream=True,
+                        allow_redirects=True,
+                    )
+                    if response.status_code != 200:
+                        last_error = f"HTTP {response.status_code}"
+                        response.close()
+                        # A second header profile is useful for CDNs that treat
+                        # mobile and browser clients differently. It is not a
+                        # proxy or an access-control bypass.
+                        continue
+
+                    expected = response.headers.get("Content-Length")
+                    expected = int(expected) if expected and expected.isdigit() else None
+                    written = 0
+                    with open(part_path, "wb") as output:
+                        for chunk in response.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                output.write(chunk)
+                                written += len(chunk)
+                    response.close()
+
+                    if written and (expected is None or written == expected):
+                        os.replace(part_path, filepath)
+                        return True
+                    last_error = f"incomplete response ({written}/{expected or '?' } bytes)"
+
+                    # Resume from the exact byte received. This is especially
+                    # important for Koyeb's outbound connection timeout.
+                    if expected and written < expected:
+                        with open(part_path, "ab") as output:
+                            while written < expected:
+                                end = min(written + 1024 * 1024 - 1, expected - 1)
+                                range_headers = dict(h)
+                                range_headers["Range"] = f"bytes={written}-{end}"
+                                range_response = session.get(
+                                    request_url,
+                                    headers=range_headers,
+                                    timeout=(15, timeout),
+                                    stream=True,
+                                    allow_redirects=True,
+                                )
+                                if range_response.status_code != 206:
+                                    last_error = f"range HTTP {range_response.status_code} at byte {written}"
+                                    range_response.close()
+                                    break
+                                range_start = range_response.headers.get("Content-Range", "")
+                                if not range_start.startswith(f"bytes {written}-"):
+                                    last_error = f"invalid Content-Range at byte {written}"
+                                    range_response.close()
+                                    break
+                                chunk_bytes = 0
+                                for chunk in range_response.iter_content(chunk_size=1024 * 256):
+                                    if chunk:
+                                        output.write(chunk)
+                                        chunk_bytes += len(chunk)
+                                range_response.close()
+                                if not chunk_bytes:
+                                    last_error = f"empty range response at byte {written}"
+                                    break
+                                written += chunk_bytes
+                        if written == expected:
+                            os.replace(part_path, filepath)
+                            return True
+            except (requests.RequestException, OSError, ValueError) as exc:
+                last_error = str(exc)
+            finally:
+                # Never leave a corrupt file at the final path.
+                if os.path.exists(part_path) and not os.path.exists(filepath):
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+
     print(colored(f"  ⚠️ Direct download failed ({last_error}): {url}", "yellow"))
     return False
 
