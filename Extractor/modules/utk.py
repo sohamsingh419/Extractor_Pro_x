@@ -1,4 +1,5 @@
 import datetime
+import html
 import pytz
 import re
 import aiofiles
@@ -183,17 +184,31 @@ def sanitize_name(name, max_length=55):
     return name or "Unknown"
 
 
-def build_caption(index, icon, title, display_name, footer=""):
-    """Build captions as literal text; never let titles become Telegram spoilers."""
-    # A few clients still interpret spoiler delimiters when a message is
-    # forwarded/re-edited. Keep the visible characters but break the marker.
-    title = str(title).replace("||", "| |")
-    display_name = str(display_name).replace("||", "| |")
-    footer = str(footer).replace("||", "| |")
-    caption = f"[{str(index).zfill(3)}] {icon} {title}\n📚 Batch: {display_name}"
-    if footer.strip():
-        caption += f"\n{footer.strip()}"
-    return caption
+def parse_title_parts(raw_title):
+    """Parse ``Title || Topic || Date`` while tolerating missing parts."""
+    parts = [part.strip() for part in str(raw_title).split("||") if part.strip()]
+    title = parts[0] if parts else "Unknown"
+    topic = parts[1] if len(parts) >= 2 else "-"
+    date = parts[2] if len(parts) >= 3 else ""
+    if len(parts) > 3:
+        date = " ".join(parts[2:])
+    return title, topic, date
+
+
+def build_caption(index, icon, title, display_name, footer="", topic="", date=""):
+    """Build a bold HTML caption without Telegram spoiler/Markdown parsing."""
+    title, parsed_topic, parsed_date = parse_title_parts(title)
+    topic = topic or parsed_topic
+    date = date or parsed_date
+    title_value = f"{title} {date}".strip()
+    footer_value = footer.strip() or "-"
+    return (
+        f"<b>Index - {html.escape(str(index))}</b>\n"
+        f"<b>Title - {html.escape(title_value)}</b>\n"
+        f"<b>Topic - {html.escape(str(topic))}</b>\n"
+        f"<b>Batch - {html.escape(str(display_name))}</b>\n"
+        f"<b>Caption - {html.escape(footer_value)}</b>"
+    )
 
 
 async def wait_for_upload_command(chat_id):
@@ -427,7 +442,7 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
             thumb=thumb_path if os.path.exists(thumb_path) else None,
             width=1280,
             height=720,
-            parse_mode=None,
+            parse_mode="html",
         )
         return True
     except FloodWait as e:
@@ -448,7 +463,7 @@ async def upload_photo(bot_client, chat_id, filepath, caption):
     try:
         if not os.path.exists(filepath):
             return False, "downloaded image file is missing"
-        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption, parse_mode=None)
+        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption, parse_mode="html")
         return True, ""
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -470,7 +485,7 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
             document=filepath,
             caption=caption,
             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-            parse_mode=None,
+            parse_mode="html",
         )
         return True
     except FloodWait as e:
@@ -487,7 +502,7 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
 async def upload_document_from_url(bot_client, chat_id, url, caption):
     """Let Telegram fetch a public document when the Koyeb egress IP is blocked."""
     try:
-        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption, parse_mode=None)
+        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption, parse_mode="html")
         return True, ""
     except FloodWait as e:
         await asyncio.sleep(e.value)
