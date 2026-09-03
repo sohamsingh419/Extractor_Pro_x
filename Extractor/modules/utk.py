@@ -185,6 +185,11 @@ def sanitize_name(name, max_length=55):
 
 def build_caption(index, icon, title, display_name, footer=""):
     """Build captions as literal text; never let titles become Telegram spoilers."""
+    # A few clients still interpret spoiler delimiters when a message is
+    # forwarded/re-edited. Keep the visible characters but break the marker.
+    title = str(title).replace("||", "| |")
+    display_name = str(display_name).replace("||", "| |")
+    footer = str(footer).replace("||", "| |")
     caption = f"[{str(index).zfill(3)}] {icon} {title}\n📚 Batch: {display_name}"
     if footer.strip():
         caption += f"\n{footer.strip()}"
@@ -685,7 +690,8 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         try:
             test_msg = await app_client.send_message(ch_text, "🔄 Bot connected! Starting upload...")
             await test_msg.delete()
-            target_chat = ch_text
+            target_chat = int(ch_text) if re.fullmatch(r"-100\d+", ch_text) else ch_text
+            print(colored(f"  ✅ Upload target locked: {target_chat}", "green"))
         except Exception as e:
             await m.reply_text(f"❌ Failed to access channel!\nError: {str(e)}\n\nMake sure bot is ADMIN in that channel.")
             return False, None
@@ -825,6 +831,13 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"🔄 Starting from: <code>{resume_index + 1}</code>\n\n"
         f"⏳ Downloading..."
     )
+    progress_msg = await m.reply_text(
+        "⏳ <b>Uploading</b>\n"
+        "├ Progress » <code>0.0%</code>\n"
+        f"├ Processed » <code>0/{len(all_urls)}</code>\n"
+        f"└ Target » <code>{target_chat}</code>\n\n"
+        "Use /pause, /resume or /fullstop"
+    )
 
     count = resume_count
     failed = resume_failed
@@ -863,6 +876,17 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                 "timestamp": time.time()
             }
             save_upload_state(upload_state)
+
+            await safe_edit_message(
+                progress_msg,
+                "⏳ <b>Uploading</b>\n"
+                f"├ Progress » <code>{(idx / len(all_urls) * 100) if all_urls else 0:.1f}%</code>\n"
+                f"├ Processed » <code>{idx}/{len(all_urls)}</code>\n"
+                f"├ Success » <code>{success}</code>  Failed » <code>{failed}</code>\n"
+                f"├ Target » <code>{target_chat}</code>\n"
+                f"└ Current » <code>{safe_title[:45]}</code>\n\n"
+                "Use /pause, /resume or /fullstop"
+            )
 
             # Show storage status every 5 files
             if count % 5 == 0:
@@ -1065,6 +1089,14 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"📁 Total: <code>{len(all_urls)}</code>\n"
         f"💾 Storage: <code>0 MB</code> (cleaned)\n\n"
         f"🎉 All Done!"
+    )
+    await safe_edit_message(
+        progress_msg,
+        "✅ <b>Uploading complete</b>\n"
+        "├ Progress » <code>100.0%</code>\n"
+        f"├ Processed » <code>{len(all_urls)}/{len(all_urls)}</code>\n"
+        f"├ Success » <code>{success}</code>  Failed » <code>{failed}</code>\n"
+        f"└ Target » <code>{target_chat}</code>"
     )
 
     for temporary_asset in (thumb_path, "custom_thumb_optimized.jpg"):
