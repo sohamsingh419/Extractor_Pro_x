@@ -202,14 +202,15 @@ def build_caption(index, icon, title, display_name, footer="", topic="", date=""
     topic = topic or parsed_topic
     date = date or parsed_date
     title_value = f"{title} {date}".strip()
-    footer_value = footer.strip() or "-"
-    return (
-        f"<b>Index - {html.escape(str(index))}</b>\n"
-        f"<b>Title - {html.escape(title_value)}</b>\n"
-        f"<b>Topic - {html.escape(str(topic))}</b>\n"
-        f"<b>Batch - {html.escape(str(display_name))}</b>\n"
-        f"<b>Caption - {html.escape(footer_value)}</b>"
-    )
+    lines = [
+        f"<b>Index - {html.escape(str(index))}</b>",
+        f"<b>Title - {html.escape(title_value)}</b>",
+        f"<b>Topic - {html.escape(str(topic))}</b>",
+        f"<b>Batch - {html.escape(str(display_name))}</b>",
+    ]
+    if footer.strip():
+        lines.append(f"<b>Caption - {html.escape(footer.strip())}</b>")
+    return "\n\n".join(lines)
 
 
 async def wait_for_upload_command(chat_id):
@@ -814,47 +815,44 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     upload_state = load_upload_state()
     resume_index = 0
 
-    if state_key in upload_state:
-        resume_data = upload_state[state_key]
-        resume_index = resume_data.get("last_index", 0)
-        resume_count = resume_data.get("count", 1)
-        resume_success = resume_data.get("success", 0)
-        resume_failed = resume_data.get("failed", 0)
+    saved_state = upload_state.get(state_key, {})
+    saved_index = int(saved_state.get("last_index", 0) or 0)
+    saved_count = int(saved_state.get("count", saved_index + 1) or (saved_index + 1))
+    saved_success = int(saved_state.get("success", 0) or 0)
+    saved_failed = int(saved_state.get("failed", 0) or 0)
+    default_start = saved_index + 1 if saved_index > 0 else 1
 
-        if resume_index > 0 and resume_index < len(all_urls):
-            resume_msg = await m.reply_text(
-                f"🔄 <b>Resume Found!</b>\n\n"
-                f"📁 Batch: <b>{display_name}</b>\n"
-                f"📊 Progress: <code>{resume_index}/{len(all_urls)}</code>\n\n"
-                f"Reply <code>yes</code> to RESUME from file {resume_count}\n"
-                f"Reply <code>no</code> to START FRESH"
-            )
-            resume_input = await app_client.listen(chat_id=chat_id)
-            resume_choice = resume_input.text.strip().lower()
-            await resume_input.delete()
-            await resume_msg.delete()
+    start_prompt = await m.reply_text(
+        "🔢 <b>Starting link number</b>\n\n"
+        f"Total links: <code>{len(all_urls)}</code>\n"
+        f"Saved progress: <code>{default_start}</code> (if available)\n\n"
+        "Upload kis link number se start karna hai?\n"
+        "Example: <code>15</code>\n"
+        "Saved progress se continue karne ke liye Enter ki jagah <code>resume</code> likhein."
+    )
+    start_input = await app_client.listen(chat_id=chat_id)
+    requested_start = (start_input.text or "").strip().lower()
+    await start_input.delete()
+    await start_prompt.delete()
 
-            if resume_choice == "yes":
-                print(colored(f"🔄 Resuming upload from index {resume_index}", "cyan"))
-            else:
-                resume_index = 0
-                resume_count = 1
-                resume_success = 0
-                resume_failed = 0
-                upload_state.pop(state_key, None)
-                save_upload_state(upload_state)
-        else:
-            upload_state.pop(state_key, None)
-            save_upload_state(upload_state)
-            resume_index = 0
-            resume_count = 1
-            resume_success = 0
-            resume_failed = 0
+    if requested_start == "resume" and saved_index > 0:
+        resume_index = saved_index
+        resume_count = saved_count
+        resume_success = saved_success
+        resume_failed = saved_failed
     else:
-        resume_index = 0
-        resume_count = 1
+        try:
+            selected_number = int(requested_start or default_start)
+        except ValueError:
+            selected_number = default_start
+        selected_number = max(1, min(selected_number, len(all_urls)))
+        resume_index = selected_number - 1
+        resume_count = selected_number
         resume_success = 0
         resume_failed = 0
+        # A manually selected starting point is a new resumable run.
+        upload_state.pop(state_key, None)
+        save_upload_state(upload_state)
 
     start_msg = await m.reply_text(
         f"🚀 <b>Starting Upload!</b>\n\n"
