@@ -13,6 +13,7 @@ import hashlib
 import random
 import glob
 from pyrogram import filters
+from pyrogram.enums import ParseMode
 from Extractor import app
 from config import CHANNEL_ID, THUMB_URL
 from colorama import Fore, Style, init
@@ -442,7 +443,7 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
             thumb=thumb_path if os.path.exists(thumb_path) else None,
             width=1280,
             height=720,
-            parse_mode="html",
+            parse_mode=ParseMode.HTML,
         )
         return True
     except FloodWait as e:
@@ -463,7 +464,7 @@ async def upload_photo(bot_client, chat_id, filepath, caption):
     try:
         if not os.path.exists(filepath):
             return False, "downloaded image file is missing"
-        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption, parse_mode="html")
+        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption, parse_mode=ParseMode.HTML)
         return True, ""
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -485,7 +486,7 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
             document=filepath,
             caption=caption,
             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-            parse_mode="html",
+            parse_mode=ParseMode.HTML,
         )
         return True
     except FloodWait as e:
@@ -500,15 +501,33 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
 
 
 async def upload_document_from_url(bot_client, chat_id, url, caption):
-    """Let Telegram fetch a public document when the Koyeb egress IP is blocked."""
+    """Let Telegram fetch a public document when Koyeb cannot reach its CDN."""
     try:
-        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption, parse_mode="html")
+        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption, parse_mode=ParseMode.HTML)
         return True, ""
     except FloodWait as e:
         await asyncio.sleep(e.value)
         return await upload_document_from_url(bot_client, chat_id, url, caption)
     except Exception as e:
         print(colored(f"  ❌ Telegram URL upload error: {e}", "red"))
+        return False, str(e)
+
+
+async def upload_photo_from_url(bot_client, chat_id, url, caption):
+    """Let Telegram fetch a public image when Koyeb cannot reach its CDN."""
+    try:
+        await bot_client.send_photo(
+            chat_id=chat_id,
+            photo=url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return True, ""
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await upload_photo_from_url(bot_client, chat_id, url, caption)
+    except Exception as e:
+        print(colored(f"  ❌ Telegram image URL upload error: {e}", "red"))
         return False, str(e)
 
 
@@ -970,10 +989,25 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                             text=f"❌ <b>Image upload failed:</b> <code>{safe_title}</code>\n🛑 <code>{upload_error[:300]}</code>"
                         )
                 else:
+                    url_ok, url_error = await upload_photo_from_url(
+                        app_client, target_chat, url, cap_pdf
+                    )
+                    if url_ok:
+                        success += 1
+                        count += 1
+                        upload_state[state_key].update({
+                            "last_index": idx + 1,
+                            "count": count,
+                            "success": success,
+                            "failed": failed,
+                        })
+                        save_upload_state(upload_state)
+                        await asyncio.sleep(2)
+                        continue
                     failed += 1
                     await app_client.send_message(
                         chat_id=chat_id,
-                        text=f"❌ <b>Image download failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                        text=f"❌ <b>Image download failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>\n🛑 <code>{url_error[:300]}</code>"
                     )
 
             elif is_pdf:
