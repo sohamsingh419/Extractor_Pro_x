@@ -271,9 +271,6 @@ def photo():
 
 @app.on_message(filters.command("start"))  # & filters.user(SUDO_USERS))
 async def start(_, message):
-    join = await subscribe(_, message)
-    if join == 1:
-        return
     try:
         await message.reply_photo(
             photo=photo(),

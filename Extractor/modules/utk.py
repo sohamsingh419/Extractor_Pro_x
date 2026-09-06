@@ -966,10 +966,25 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                             text=f"❌ <b>Note upload failed:</b> <code>{safe_title}</code>"
                         )
                 else:
+                    url_ok, url_error = await upload_document_from_url(
+                        app_client, target_chat, url, cap_note
+                    )
+                    if url_ok:
+                        success += 1
+                        count += 1
+                        upload_state[state_key].update({
+                            "last_index": idx + 1,
+                            "count": count,
+                            "success": success,
+                            "failed": failed,
+                        })
+                        save_upload_state(upload_state)
+                        await asyncio.sleep(2)
+                        continue
                     failed += 1
                     await app_client.send_message(
                         chat_id=chat_id,
-                        text=f"❌ <b>Failed note download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                        text=f"❌ <b>Failed note download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>\n🛑 <code>{url_error[:300]}</code>"
                     )
 
             elif is_image:
@@ -1073,10 +1088,27 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     else:
                         failed += 1
                 else:
+                    # Extensionless/file-library URLs may still be valid
+                    # media. Let Telegram fetch the public URL directly.
+                    url_ok, url_error = await upload_document_from_url(
+                        app_client, target_chat, url, cap_vid
+                    )
+                    if url_ok:
+                        success += 1
+                        count += 1
+                        upload_state[state_key].update({
+                            "last_index": idx + 1,
+                            "count": count,
+                            "success": success,
+                            "failed": failed,
+                        })
+                        save_upload_state(upload_state)
+                        await asyncio.sleep(2)
+                        continue
                     failed += 1
                     await app_client.send_message(
                         chat_id=chat_id,
-                        text=f"❌ <b>Failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:60]}...</code>"
+                        text=f"❌ <b>Failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>\n🛑 <code>{url_error[:300]}</code>"
                     )
 
             count += 1
