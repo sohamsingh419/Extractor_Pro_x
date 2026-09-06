@@ -33,7 +33,6 @@ from Extractor.modules.findapi import findapis_extract
 from Extractor.modules.rg_vikramjeet import rgvikramjeet
 from Extractor.modules.adda import adda_command_handler
 from Extractor.modules.vision import scrape_vision_ias
-from Extractor.modules.rg_vikramjeet import rgvikramjeet
 from Extractor.core.utils import forward_to_log
 from Extractor.modules.enc import *
 
