@@ -1068,9 +1068,3 @@ async def html_to_text_command(client: Client, message: Message):
         
     except Exception as e:
         await message.reply_text(f"❌ Error: {str(e)}")
-
-
-
-    
-
-    
