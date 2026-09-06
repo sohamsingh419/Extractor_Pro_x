@@ -1,25 +1,25 @@
-# Use official Python 3.10.11 image
-FROM python:3.10.11-slim
+FROM python:3.10-slim-bookworm
 
-# Set work directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
 WORKDIR /app
 
-# Install system dependencies (if needed, can be removed if not using any OS deps)
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    ffmpeg \
-    aria2 \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg aria2 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements (if you use one)
-COPY requirements.txt .
+COPY requirements.txt ./requirements.txt
 
-# Install Python dependencies. yt-dlp is Python-installed, while ffmpeg/aria2
-# above are OS binaries required by the video downloader.
-RUN pip install --no-cache-dir -r requirements.txt yt-dlp
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --prefer-binary -r requirements.txt \
+    && python -m pip install --prefer-binary yt-dlp
 
-# Copy your code
 COPY . .
 
-# Run the Extractor module
-CMD ["sh", "-c", "python -m Extractor"]
+RUN python -m py_compile Extractor/modules/start.py Extractor/core/func.py Extractor/modules/utk.py
+
+CMD ["python", "-m", "Extractor"]
