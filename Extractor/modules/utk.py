@@ -564,6 +564,7 @@ async def api_request(
     path: str,
     json_data=None,
     retries=MAX_RETRIES,
+    request_timeout=TIMEOUT,
 ):
     async with api_semaphore:
         headers = get_auth_headers(token)
@@ -572,7 +573,7 @@ async def api_request(
             try:
                 if method == "GET":
                     async with session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=request_timeout)
                     ) as resp:
                         text = await resp.text()
                         data = json.loads(text) if text else {}
@@ -592,7 +593,7 @@ async def api_request(
                         return data
                 elif method == "POST":
                     async with session.post(
-                        url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+                        url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=request_timeout)
                     ) as resp:
                         text = await resp.text()
                         data = json.loads(text) if text else {}
@@ -1511,7 +1512,18 @@ async def handle_utk_logic(app_client, m):
 
                         for topic in topics:
                             topic_id = topic.get("_id") or topic.get("id")
-                            contents_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details")
+                            try:
+                                contents_resp = await api_request(
+                                    session,
+                                    token,
+                                    "GET",
+                                    f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details",
+                                    retries=2,
+                                    request_timeout=30,
+                                )
+                            except Exception as topic_error:
+                                print(colored(f"      ⚠️ Skipping topic {topic_id}: {topic_error}", "yellow"))
+                                continue
                             if contents_resp.get("status") == 429:
                                 print(colored("⚠️ Rate limit during contents fetch, saving state...", "yellow"))
                                 state[resume_key]["urls"] = all_urls
@@ -1529,7 +1541,18 @@ async def handle_utk_logic(app_client, m):
                             for content in contents:
                                 content_id = content.get("id") or content.get("_id")
                                 content_title = content.get("title", "Unknown")
-                                detail_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details")
+                                try:
+                                    detail_resp = await api_request(
+                                        session,
+                                        token,
+                                        "GET",
+                                        f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
+                                        retries=2,
+                                        request_timeout=30,
+                                    )
+                                except Exception as content_error:
+                                    print(colored(f"        ⚠️ Skipping content {content_id}: {content_error}", "yellow"))
+                                    continue
                                 if detail_resp.get("status") == 429:
                                     print(colored("⚠️ Rate limit during link fetch, saving state...", "yellow"))
                                     state[resume_key]["urls"] = all_urls
