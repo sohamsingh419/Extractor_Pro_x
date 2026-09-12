@@ -35,15 +35,15 @@ UPDATE_DELAY = 5
 UPDATE_INTERVAL = 15
 EDIT_LOCK = asyncio.Lock()
 
-API_DELAY = 2.5
+API_DELAY = float(os.environ.get("UTKARSH_API_DELAY", "0.75"))
 MAX_CONCURRENT = 1
 RATE_LIMIT_RETRY = 600
 BATCH_PAUSE = 10
 SUBJECT_PAUSE = 5
 TOPIC_PAUSE = 3
 CONTENT_PAUSE = 2
-JITTER_MIN = 1
-JITTER_MAX = 4
+JITTER_MIN = float(os.environ.get("UTKARSH_JITTER_MIN", "0.2"))
+JITTER_MAX = float(os.environ.get("UTKARSH_JITTER_MAX", "0.8"))
 
 STATE_FILE = "./bot_state.json"
 UPLOAD_STATE_FILE = "./upload_state.json"
@@ -194,6 +194,227 @@ def parse_title_parts(raw_title):
     if len(parts) > 3:
         date = " ".join(parts[2:])
     return title, topic, date
+
+
+CONTENT_LINK_KEYS = (
+    "link",
+    "file_url",
+    "fileUrl",
+    "url",
+    "video_url",
+    "videoUrl",
+    "download_url",
+    "downloadUrl",
+    "pdf_url",
+    "pdfUrl",
+    "content_url",
+    "contentUrl",
+    "resource_url",
+    "resourceUrl",
+    "media_url",
+    "mediaUrl",
+    "stream_url",
+    "streamUrl",
+    "play_url",
+    "playUrl",
+    "playback_url",
+    "playbackUrl",
+    "m3u8",
+    "mpd",
+    "file",
+    "file_path",
+    "filePath",
+    "ws_file",
+    "wsFile",
+    "photo",
+    "photo_url",
+    "photoUrl",
+    "image",
+    "image_url",
+    "imageUrl",
+    "document_url",
+    "documentUrl",
+)
+
+THUMBNAIL_LINK_KEYS = (
+    "thumbnail",
+    "thumbnail_url",
+    "thumbnailUrl",
+    "image",
+    "image_url",
+    "imageUrl",
+    "cover",
+    "cover_url",
+    "coverUrl",
+)
+
+
+def response_items(response, collection_keys=()):
+    """Return API response data as a list across old and new response shapes.
+
+    Utkarsh has returned both ``data: [...]`` and ``data: {items: [...]}``
+    from these endpoints.  A single content object is also valid for the
+    content-details endpoint, so it must not be iterated as a dictionary.
+    """
+    if not isinstance(response, dict):
+        return []
+
+    data = response.get("data", response)
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+
+    keys = tuple(collection_keys) + (
+        "items",
+        "results",
+        "records",
+        "contents",
+        "subjects",
+        "topics",
+        "batches",
+        "content",
+        "data",
+        "list",
+        "children",
+        "subTopics",
+        "chapters",
+    )
+    for key in keys:
+        nested = data.get(key)
+        if isinstance(nested, list):
+            return nested
+        if isinstance(nested, dict):
+            return [nested]
+
+    return [data]
+
+
+def extract_content_links(value):
+    """Find every media URL in nested content API data without duplicates."""
+    found = []
+
+    def add(link):
+        link = link.strip()
+        if link.startswith(("http://", "https://")) and link not in found:
+            found.append(link)
+
+    if isinstance(value, str):
+        add(value)
+        return found
+    if isinstance(value, list):
+        for item in value:
+            for link in extract_content_links(item):
+                add(link)
+        return found
+    if not isinstance(value, dict):
+        return found
+
+    # Read all known media fields. A content item can expose more than one
+    # asset (for example a video plus a PDF or a photo).
+    for key in CONTENT_LINK_KEYS:
+        for link in extract_content_links(value.get(key)):
+            add(link)
+
+    # Newer responses may wrap assets under these containers.
+    nested_keys = {
+        "data",
+        "content",
+        "contents",
+        "resource",
+        "resources",
+        "media",
+        "asset",
+        "assets",
+        "file",
+        "files",
+        "video",
+        "videos",
+        "document",
+        "documents",
+        "photo",
+        "photos",
+        "result",
+        "results",
+        "items",
+        "item",
+        "links",
+        "urls",
+        "attachments",
+        "mediaFiles",
+    }
+    ignored_metadata_keys = {
+        "_id",
+        "id",
+        "title",
+        "name",
+        "description",
+        "type",
+        "thumbnail",
+        "thumbnail_url",
+        "thumbnailUrl",
+        "poster",
+        "poster_url",
+        "posterUrl",
+        "cover",
+        "cover_url",
+        "coverUrl",
+        "icon",
+        "icon_url",
+        "iconUrl",
+    }
+    for key, nested in value.items():
+        if key in ignored_metadata_keys or key not in nested_keys:
+            continue
+        for link in extract_content_links(nested):
+            add(link)
+    return found
+
+
+def extract_content_link(value):
+    """Backward-compatible helper returning the first media URL."""
+    links = extract_content_links(value)
+    return links[0] if links else ""
+
+
+def extract_thumbnail_link(value):
+    """Find only a batch/course thumbnail, not a content media URL."""
+    if isinstance(value, str):
+        return value.strip() if value.strip().startswith(("http://", "https://")) else ""
+    if isinstance(value, list):
+        for item in value:
+            thumbnail = extract_thumbnail_link(item)
+            if thumbnail:
+                return thumbnail
+        return ""
+    if not isinstance(value, dict):
+        return ""
+
+    for key in THUMBNAIL_LINK_KEYS:
+        thumbnail = extract_thumbnail_link(value.get(key))
+        if thumbnail:
+            return thumbnail
+
+    # Batch details may wrap metadata under one of these objects.
+    for key in ("data", "batch", "course", "details", "metadata"):
+        thumbnail = extract_thumbnail_link(value.get(key))
+        if thumbnail:
+            return thumbnail
+    return ""
+
+
+def extract_content_id(value):
+    """Read an id from an item while tolerating nested content objects."""
+    if not isinstance(value, dict):
+        return ""
+    for key in ("id", "_id", "contentId", "content_id"):
+        if value.get(key) is not None:
+            return value[key]
+    for key in ("content", "data", "item", "resource"):
+        nested_id = extract_content_id(value.get(key))
+        if nested_id:
+            return nested_id
+    return ""
 
 
 def build_caption(index, icon, title, display_name, footer="", topic="", date=""):
@@ -936,7 +1157,11 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
 
             normalized_url = requests.utils.unquote(url).lower()
             is_note = ".ws" in normalized_url or "file_manager/notes" in normalized_url
-            is_image = any(ext in normalized_url.split("?")[0] for ext in (".jpg", ".jpeg", ".png", ".webp"))
+            is_batch_thumbnail = title.startswith("[BATCH THUMBNAIL]")
+            is_image = is_batch_thumbnail or any(
+                ext in normalized_url.split("?")[0]
+                for ext in (".jpg", ".jpeg", ".png", ".webp")
+            )
             is_pdf = (
                 ".pdf" in normalized_url
                 or "pannel-files" in normalized_url
@@ -1431,14 +1656,25 @@ async def handle_utk_logic(app_client, m):
                     await progress_msg.edit(f"❌ Batch ID <code>{batch_id}</code> not found!")
                     continue
 
-                sub_batches = batch_details.get("data", [])
+                sub_batches = response_items(batch_details, ("batches",))
                 bname = next(
                     (x["title"] for x in sub_batches if str(x.get("_id") or x.get("id")) == batch_id),
                     f"Batch_{batch_id}",
                 )
                 print(colored(f"\n📦 Processing batch: {bname} (ID: {batch_id})", "cyan"))
                 all_urls = []
+                seen_links = set()
                 total_links = 0
+                batch_thumbnail = extract_thumbnail_link(batch_details)
+                if not batch_thumbnail:
+                    for sub_batch in sub_batches:
+                        batch_thumbnail = extract_thumbnail_link(sub_batch)
+                        if batch_thumbnail:
+                            break
+                if batch_thumbnail:
+                    all_urls.append(f"[BATCH THUMBNAIL] {bname}: {batch_thumbnail}")
+                    seen_links.add(batch_thumbnail)
+                    total_links += 1
 
                 state[resume_key] = {
                     "extracting": True,
@@ -1466,7 +1702,7 @@ async def handle_utk_logic(app_client, m):
                         return
                     if not subjects_resp or not subjects_resp.get("success"):
                         continue
-                    subjects = subjects_resp.get("data", [])
+                    subjects = response_items(subjects_resp, ("subjects",))
                     print(colored(f"  📚 {len(subjects)} subjects in sub-batch {sub_batch_id}", "cyan"))
                     try:
                         await progress_msg.edit(
@@ -1507,7 +1743,7 @@ async def handle_utk_logic(app_client, m):
                             return
                         if not topics_resp or not topics_resp.get("success"):
                             continue
-                        topics = topics_resp.get("data", [])
+                        topics = response_items(topics_resp, ("topics",))
                         print(colored(f"      📖 {len(topics)} topics", "white"))
 
                         for topic in topics:
@@ -1536,22 +1772,18 @@ async def handle_utk_logic(app_client, m):
                                 return
                             if not contents_resp or not contents_resp.get("success"):
                                 continue
-                            contents = contents_resp.get("data", [])
+                            contents = response_items(contents_resp, ("contents",))
 
                             for content in contents:
-                                content_id = content.get("id") or content.get("_id")
-                                content_title = content.get("title", "Unknown")
-                                direct_link = (
-                                    content.get("link")
-                                    or content.get("file_url")
-                                    or content.get("url")
-                                    or content.get("video_url")
-                                    or content.get("download_url")
-                                    or content.get("pdf_url")
-                                    or ""
+                                content_id = extract_content_id(content)
+                                content_title = (
+                                    content.get("title", "Unknown")
+                                    if isinstance(content, dict)
+                                    else "Unknown"
                                 )
-                                if direct_link:
-                                    detail_resp = {"success": True, "data": {"link": direct_link}}
+                                direct_links = extract_content_links(content)
+                                if direct_links:
+                                    detail_resp = {"success": True, "data": {"links": direct_links}}
                                 else:
                                     try:
                                         detail_resp = await api_request(
@@ -1577,18 +1809,12 @@ async def handle_utk_logic(app_client, m):
                                     return
                                 if not detail_resp or not detail_resp.get("success"):
                                     continue
-                                data = detail_resp.get("data", {})
-                                link = (
-                                    data.get("link")
-                                    or data.get("file_url")
-                                    or data.get("url")
-                                    or data.get("video_url")
-                                    or data.get("download_url")
-                                    or data.get("pdf_url")
-                                    or ""
-                                )
-                                if link:
+                                links = extract_content_links(detail_resp)
+                                for link in links:
                                     safe_title = content_title.replace("||", "-").replace(":", "-").replace("/", "-")
+                                    if link in seen_links:
+                                        continue
+                                    seen_links.add(link)
                                     all_urls.append(f"{safe_title}: {link}")
                                     total_links += 1
                                     if total_links % 50 == 0:
