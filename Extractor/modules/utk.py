@@ -1393,7 +1393,12 @@ async def handle_utk_logic(app_client, m):
         login_msg = f"<b>✅ {appname} Login Successful</b>\n"
         login_msg += f"\n<b>🆔 Credentials:</b> <code>{raw_text}</code>\n\n"
         login_msg += f"\n<b>📚 {mode_text}</b> — <b>{len(batches)} batches found</b>\n\n{cool}"
-        await app_client.send_message(txt_dump, login_msg)
+        # Logging is best-effort. If the configured dump channel is unknown to
+        # this user session (PEER_ID_INVALID), still show valid results below.
+        try:
+            await app_client.send_message(txt_dump, login_msg)
+        except Exception as log_error:
+            print(colored(f"⚠️ Could not send batch list to dump channel: {log_error}", "yellow"))
         await editable.edit(f"{FFF}\n\n<b>{mode_text}</b> — {len(batches)} batches\n\n{cool}")
 
         editable1 = await m.reply_text(
@@ -1462,10 +1467,32 @@ async def handle_utk_logic(app_client, m):
                         continue
                     subjects = subjects_resp.get("data", [])
                     print(colored(f"  📚 {len(subjects)} subjects in sub-batch {sub_batch_id}", "cyan"))
-                    await smart_sleep(SUBJECT_PAUSE)
+                    try:
+                        await progress_msg.edit(
+                            f"⏳ <b>Processing {bname}</b>\n"
+                            f"├─ Sub-batch: <code>{sub_batch_id}</code>\n"
+                            f"├─ Subjects: <code>{len(subjects)}</code>\n"
+                            f"└─ Links found: <code>{total_links}</code>"
+                        )
+                    except Exception:
+                        pass
 
-                    for subject in subjects:
+                    for subject_index, subject in enumerate(subjects, start=1):
                         subject_id = subject.get("_id") or subject.get("id")
+                        subject_name = subject.get("title", "Unknown subject")
+                        print(colored(
+                            f"    🔎 Subject {subject_index}/{len(subjects)}: {subject_name}",
+                            "white",
+                        ))
+                        try:
+                            await progress_msg.edit(
+                                f"⏳ <b>Processing {bname}</b>\n"
+                                f"├─ Subject: <code>{subject_index}/{len(subjects)}</code>\n"
+                                f"├─ Current: {html.escape(str(subject_name))[:80]}\n"
+                                f"└─ Links found: <code>{total_links}</code>"
+                            )
+                        except Exception:
+                            pass
                         topics_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/details")
                         if topics_resp.get("status") == 429:
                             print(colored("⚠️ Rate limit during topics fetch, saving state...", "yellow"))
@@ -1480,7 +1507,7 @@ async def handle_utk_logic(app_client, m):
                         if not topics_resp or not topics_resp.get("success"):
                             continue
                         topics = topics_resp.get("data", [])
-                        await smart_sleep(TOPIC_PAUSE)
+                        print(colored(f"      📖 {len(topics)} topics", "white"))
 
                         for topic in topics:
                             topic_id = topic.get("_id") or topic.get("id")
@@ -1498,7 +1525,6 @@ async def handle_utk_logic(app_client, m):
                             if not contents_resp or not contents_resp.get("success"):
                                 continue
                             contents = contents_resp.get("data", [])
-                            await smart_sleep(CONTENT_PAUSE)
 
                             for content in contents:
                                 content_id = content.get("id") or content.get("_id")
@@ -1531,7 +1557,6 @@ async def handle_utk_logic(app_client, m):
                                         )
                                     state[resume_key]["urls"] = all_urls
                                     save_state(state)
-                                await smart_sleep(1)
 
                 if not all_urls:
                     await progress_msg.edit(f"⚠️ No content URLs found in batch <code>{bname}</code>")
