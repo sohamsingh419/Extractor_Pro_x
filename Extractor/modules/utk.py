@@ -1451,8 +1451,8 @@ async def handle_utk_logic(app_client, m):
                 save_state(state)
 
                 for sub_batch in sub_batches:
-                    parent_id = sub_batch.get("parentId") or sub_batch.get("parent_id") or batch_id
                     sub_batch_id = sub_batch.get("_id") or sub_batch.get("id")
+                    parent_id = sub_batch.get("parentId") or sub_batch.get("parent_id") or sub_batch_id or batch_id
                     subjects_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/details")
                     if subjects_resp.get("status") == 429:
                         print(colored("⚠️ Rate limit during subjects fetch, saving state...", "yellow"))
@@ -1541,18 +1541,30 @@ async def handle_utk_logic(app_client, m):
                             for content in contents:
                                 content_id = content.get("id") or content.get("_id")
                                 content_title = content.get("title", "Unknown")
-                                try:
-                                    detail_resp = await api_request(
-                                        session,
-                                        token,
-                                        "GET",
-                                        f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
-                                        retries=2,
-                                        request_timeout=30,
-                                    )
-                                except Exception as content_error:
-                                    print(colored(f"        ⚠️ Skipping content {content_id}: {content_error}", "yellow"))
-                                    continue
+                                direct_link = (
+                                    content.get("link")
+                                    or content.get("file_url")
+                                    or content.get("url")
+                                    or content.get("video_url")
+                                    or content.get("download_url")
+                                    or content.get("pdf_url")
+                                    or ""
+                                )
+                                if direct_link:
+                                    detail_resp = {"success": True, "data": {"link": direct_link}}
+                                else:
+                                    try:
+                                        detail_resp = await api_request(
+                                            session,
+                                            token,
+                                            "GET",
+                                            f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
+                                            retries=2,
+                                            request_timeout=30,
+                                        )
+                                    except Exception as content_error:
+                                        print(colored(f"        ⚠️ Skipping content {content_id}: {content_error}", "yellow"))
+                                        continue
                                 if detail_resp.get("status") == 429:
                                     print(colored("⚠️ Rate limit during link fetch, saving state...", "yellow"))
                                     state[resume_key]["urls"] = all_urls
@@ -1566,7 +1578,15 @@ async def handle_utk_logic(app_client, m):
                                 if not detail_resp or not detail_resp.get("success"):
                                     continue
                                 data = detail_resp.get("data", {})
-                                link = data.get("link", "")
+                                link = (
+                                    data.get("link")
+                                    or data.get("file_url")
+                                    or data.get("url")
+                                    or data.get("video_url")
+                                    or data.get("download_url")
+                                    or data.get("pdf_url")
+                                    or ""
+                                )
                                 if link:
                                     safe_title = content_title.replace("||", "-").replace(":", "-").replace("/", "-")
                                     all_urls.append(f"{safe_title}: {link}")
