@@ -54,7 +54,10 @@ ACTIVE_UPLOADS = {}
 
 BASE_URL = "https://api.asmultiverse.app"
 DEVICE_ID = "2cfbaa6be65acdc5"
-SECRET_KEY = "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0="
+SECRET_KEY = os.environ.get(
+    "UTK_SECRET_KEY",
+    "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0=",
+)
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjE0NDQ2MTEzIiwiZGV2aWNlX3R5cGUiOiI0IiwidmVyc2lvbl9jb2RlIjoiMSIsImljciI6IjAiLCJpYXQiOjE3ODgyMzYwOTYsImV4cCI6MTc5MDM5NjA5Nn0.Sn6Ad_klMRf3HJmE81ETHXSIGtSs1r4FyflU_77x3wI"
 
 api_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -222,8 +225,13 @@ def extract_media_urls(payload):
                 return
             normalized_key = key.replace("__", "_")
             lower_url = candidate.lower()
+            key_hint = any(
+                token in normalized_key
+                for token in ("url", "link", "path", "file", "stream", "play", "download", "source", "src")
+            )
             media_hint = (
                 normalized_key in MEDIA_URL_KEYS
+                or key_hint
                 or any(ext in lower_url for ext in (
                     ".mp4", ".mkv", ".m3u8", ".pdf", ".jpg", ".jpeg", ".png",
                     ".webp", ".ws", "/file_manager/", "/file_library/", "cloudfront"
@@ -573,7 +581,11 @@ async def upload_photo_from_url(bot_client, chat_id, url, caption):
 
 
 def generate_signature(timestamp: str) -> str:
-    key = base64.b64decode(SECRET_KEY)
+    try:
+        key = base64.b64decode(SECRET_KEY, validate=True)
+    except (ValueError, TypeError):
+        # New deployments may provide a raw auth key instead of base64.
+        key = SECRET_KEY.encode("utf-8")
     signature = hmac.new(key, timestamp.encode(), hashlib.sha256).digest()
     return base64.b64encode(signature).decode()
 
