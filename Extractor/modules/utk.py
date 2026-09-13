@@ -29,21 +29,21 @@ init(autoreset=True)
 
 appname = "Utkarsh"
 txt_dump = CHANNEL_ID
-MAX_RETRIES = 5
-TIMEOUT = 90
-UPDATE_DELAY = 5
+MAX_RETRIES = 3
+TIMEOUT = 45
+UPDATE_DELAY = 1
 UPDATE_INTERVAL = 15
 EDIT_LOCK = asyncio.Lock()
 
-API_DELAY = 2.5
+API_DELAY = 0.8
 MAX_CONCURRENT = 1
 RATE_LIMIT_RETRY = 600
-BATCH_PAUSE = 10
-SUBJECT_PAUSE = 5
-TOPIC_PAUSE = 3
-CONTENT_PAUSE = 2
-JITTER_MIN = 1
-JITTER_MAX = 4
+BATCH_PAUSE = 2
+SUBJECT_PAUSE = 1
+TOPIC_PAUSE = 1
+CONTENT_PAUSE = 0.5
+JITTER_MIN = 0.2
+JITTER_MAX = 0.8
 
 STATE_FILE = "./bot_state.json"
 UPLOAD_STATE_FILE = "./upload_state.json"
@@ -1471,6 +1471,7 @@ async def handle_utk_logic(app_client, m):
                     f"Batch_{batch_id}",
                 )
                 print(colored(f"\n📦 Processing batch: {bname} (ID: {batch_id})", "cyan"))
+                await update_extract_progress(progress_msg, bname, "Batch details loaded", 0, f"{len(sub_batches)} sections")
                 all_urls = []
                 total_links = 0
 
@@ -1502,6 +1503,7 @@ async def handle_utk_logic(app_client, m):
                         continue
                     subjects = subjects_resp.get("data", [])
                     print(colored(f"  📚 {len(subjects)} subjects in sub-batch {sub_batch_id}", "cyan"))
+                    await update_extract_progress(progress_msg, bname, "Subjects", total_links, f"section {sub_batch_id}")
                     await smart_sleep(SUBJECT_PAUSE)
 
                     for subject in subjects:
@@ -1520,6 +1522,7 @@ async def handle_utk_logic(app_client, m):
                         if not topics_resp or not topics_resp.get("success"):
                             continue
                         topics = topics_resp.get("data", [])
+                        await update_extract_progress(progress_msg, bname, "Topics", total_links, f"subject {subject_id}")
                         await smart_sleep(TOPIC_PAUSE)
 
                         for topic in topics:
@@ -1538,6 +1541,7 @@ async def handle_utk_logic(app_client, m):
                             if not contents_resp or not contents_resp.get("success"):
                                 continue
                             contents = contents_resp.get("data", [])
+                            await update_extract_progress(progress_msg, bname, "Contents", total_links, f"topic {topic_id}")
                             await smart_sleep(CONTENT_PAUSE)
 
                             for content in contents:
@@ -1573,6 +1577,10 @@ async def handle_utk_logic(app_client, m):
                                                 f"⏳ <b>Processing {bname}</b>\n"
                                                 f"├─ Links found: {total_links}\n"
                                                 f"└─ Current: <code>{safe_title[:40]}...</code>"
+                                            )
+                                        elif total_links % 10 == 0:
+                                            await update_extract_progress(
+                                                progress_msg, bname, "Links", total_links, safe_title
                                             )
                                     state[resume_key]["urls"] = all_urls
                                     save_state(state)
@@ -1721,6 +1729,18 @@ async def safe_edit_message(message, text):
                     return False
                 await asyncio.sleep(UPDATE_DELAY * 2)
         return False
+
+
+async def update_extract_progress(message, batch_name, stage, found, current=""):
+    """Show live extraction stage instead of leaving a static Processing message."""
+    text = (
+        f"⏳ <b>Extracting: {html.escape(str(batch_name))}</b>\n\n"
+        f"├ Stage » <b>{html.escape(str(stage))}</b>\n"
+        f"├ Links found » <code>{found}</code>\n"
+        f"└ Current » <code>{html.escape(str(current)[:55])}</code>\n\n"
+        "Please wait… API response is being processed."
+    )
+    await safe_edit_message(message, text)
 
 
 async def sanitize_bname(bname, max_length=50):
