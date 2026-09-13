@@ -1,5 +1,4 @@
 import datetime
-import html
 import pytz
 import re
 import aiofiles
@@ -13,7 +12,6 @@ import hashlib
 import random
 import glob
 from pyrogram import filters
-from pyrogram.enums import ParseMode
 from Extractor import app
 from config import CHANNEL_ID, THUMB_URL
 from colorama import Fore, Style, init
@@ -35,22 +33,18 @@ UPDATE_DELAY = 5
 UPDATE_INTERVAL = 15
 EDIT_LOCK = asyncio.Lock()
 
-API_DELAY = float(os.environ.get("UTKARSH_API_DELAY", "0.75"))
+API_DELAY = 2.5
 MAX_CONCURRENT = 1
 RATE_LIMIT_RETRY = 600
 BATCH_PAUSE = 10
 SUBJECT_PAUSE = 5
 TOPIC_PAUSE = 3
 CONTENT_PAUSE = 2
-JITTER_MIN = float(os.environ.get("UTKARSH_JITTER_MIN", "0.2"))
-JITTER_MAX = float(os.environ.get("UTKARSH_JITTER_MAX", "0.8"))
+JITTER_MIN = 1
+JITTER_MAX = 4
 
 STATE_FILE = "./bot_state.json"
 UPLOAD_STATE_FILE = "./upload_state.json"
-
-# One interactive upload per chat. Commands below control the active job
-# without interrupting a file that is already being downloaded/uploaded.
-ACTIVE_UPLOADS = {}
 
 BASE_URL = "https://api.asmultiverse.app"
 DEVICE_ID = "2cfbaa6be65acdc5"
@@ -150,18 +144,6 @@ async def get_folder_size():
         return 0
 
 
-def get_asset_headers():
-    """Headers accepted by Utkarsh S3 assets (images/PDFs/video files)."""
-    return {
-        "User-Agent": "okhttp/3.9.1",
-        "Accept": "*/*",
-        # Do not ask for compressed bytes: a PDF must be written exactly as
-        # received and some CDN proxies close compressed long-lived streams.
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
-    }
-
-
 def get_utkarsh_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -169,7 +151,6 @@ def get_utkarsh_headers():
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://utkarshapp.com/",
         "Origin": "https://utkarshapp.com",
-        "Accept-Encoding": "identity",
         "Connection": "keep-alive",
     }
 
@@ -185,425 +166,29 @@ def sanitize_name(name, max_length=55):
     return name or "Unknown"
 
 
-def parse_title_parts(raw_title):
-    """Parse ``Title || Topic || Date`` while tolerating missing parts."""
-    parts = [part.strip() for part in str(raw_title).split("||") if part.strip()]
-    title = parts[0] if parts else "Unknown"
-    topic = parts[1] if len(parts) >= 2 else "-"
-    date = parts[2] if len(parts) >= 3 else ""
-    if len(parts) > 3:
-        date = " ".join(parts[2:])
-    return title, topic, date
-
-
-CONTENT_LINK_KEYS = (
-    "link",
-    "file_url",
-    "fileUrl",
-    "url",
-    "video_url",
-    "videoUrl",
-    "download_url",
-    "downloadUrl",
-    "pdf_url",
-    "pdfUrl",
-    "content_url",
-    "contentUrl",
-    "resource_url",
-    "resourceUrl",
-    "media_url",
-    "mediaUrl",
-    "stream_url",
-    "streamUrl",
-    "play_url",
-    "playUrl",
-    "playback_url",
-    "playbackUrl",
-    "m3u8",
-    "mpd",
-    "file",
-    "file_path",
-    "filePath",
-    "ws_file",
-    "wsFile",
-    "photo",
-    "photo_url",
-    "photoUrl",
-    "image",
-    "image_url",
-    "imageUrl",
-    "document_url",
-    "documentUrl",
-)
-
-THUMBNAIL_LINK_KEYS = (
-    "thumbnail",
-    "thumbnail_url",
-    "thumbnailUrl",
-    "image",
-    "image_url",
-    "imageUrl",
-    "cover",
-    "cover_url",
-    "coverUrl",
-)
-
-
-def response_items(response, collection_keys=()):
-    """Return API response data as a list across old and new response shapes.
-
-    Utkarsh has returned both ``data: [...]`` and ``data: {items: [...]}``
-    from these endpoints.  A single content object is also valid for the
-    content-details endpoint, so it must not be iterated as a dictionary.
-    """
-    if not isinstance(response, dict):
-        return []
-
-    data = response.get("data", response)
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return []
-
-    keys = tuple(collection_keys) + (
-        "items",
-        "results",
-        "records",
-        "contents",
-        "subjects",
-        "topics",
-        "batches",
-        "content",
-        "data",
-        "list",
-        "children",
-        "subTopics",
-        "chapters",
-    )
-    for key in keys:
-        nested = data.get(key)
-        if isinstance(nested, list):
-            return nested
-        if isinstance(nested, dict):
-            return [nested]
-
-    return [data]
-
-
-def extract_content_links(value):
-    """Find every media URL in nested content API data without duplicates."""
-    found = []
-
-    def add(link):
-        link = link.strip()
-        if link.startswith(("http://", "https://")) and link not in found:
-            found.append(link)
-
-    if isinstance(value, str):
-        add(value)
-        return found
-    if isinstance(value, list):
-        for item in value:
-            for link in extract_content_links(item):
-                add(link)
-        return found
-    if not isinstance(value, dict):
-        return found
-
-    # Read all known media fields. A content item can expose more than one
-    # asset (for example a video plus a PDF or a photo).
-    for key in CONTENT_LINK_KEYS:
-        for link in extract_content_links(value.get(key)):
-            add(link)
-
-    # Newer responses may wrap assets under these containers.
-    nested_keys = {
-        "data",
-        "content",
-        "contents",
-        "resource",
-        "resources",
-        "media",
-        "asset",
-        "assets",
-        "file",
-        "files",
-        "video",
-        "videos",
-        "document",
-        "documents",
-        "photo",
-        "photos",
-        "result",
-        "results",
-        "items",
-        "item",
-        "links",
-        "urls",
-        "attachments",
-        "mediaFiles",
-    }
-    ignored_metadata_keys = {
-        "_id",
-        "id",
-        "title",
-        "name",
-        "description",
-        "type",
-        "thumbnail",
-        "thumbnail_url",
-        "thumbnailUrl",
-        "poster",
-        "poster_url",
-        "posterUrl",
-        "cover",
-        "cover_url",
-        "coverUrl",
-        "icon",
-        "icon_url",
-        "iconUrl",
-    }
-    for key, nested in value.items():
-        if key in ignored_metadata_keys or key not in nested_keys:
-            continue
-        for link in extract_content_links(nested):
-            add(link)
-    return found
-
-
-def extract_content_link(value):
-    """Backward-compatible helper returning the first media URL."""
-    links = extract_content_links(value)
-    return links[0] if links else ""
-
-
-def extract_thumbnail_link(value):
-    """Find only a batch/course thumbnail, not a content media URL."""
-    if isinstance(value, str):
-        return value.strip() if value.strip().startswith(("http://", "https://")) else ""
-    if isinstance(value, list):
-        for item in value:
-            thumbnail = extract_thumbnail_link(item)
-            if thumbnail:
-                return thumbnail
-        return ""
-    if not isinstance(value, dict):
-        return ""
-
-    for key in THUMBNAIL_LINK_KEYS:
-        thumbnail = extract_thumbnail_link(value.get(key))
-        if thumbnail:
-            return thumbnail
-
-    # Batch details may wrap metadata under one of these objects.
-    for key in ("data", "batch", "course", "details", "metadata"):
-        thumbnail = extract_thumbnail_link(value.get(key))
-        if thumbnail:
-            return thumbnail
-    return ""
-
-
-def extract_content_id(value):
-    """Read an id from an item while tolerating nested content objects."""
-    if not isinstance(value, dict):
-        return ""
-    for key in ("id", "_id", "contentId", "content_id"):
-        if value.get(key) is not None:
-            return value[key]
-    for key in ("content", "data", "item", "resource"):
-        nested_id = extract_content_id(value.get(key))
-        if nested_id:
-            return nested_id
-    return ""
-
-
-def build_caption(index, icon, title, display_name, footer="", topic="", date=""):
-    """Build a bold HTML caption without Telegram spoiler/Markdown parsing."""
-    title, parsed_topic, parsed_date = parse_title_parts(title)
-    topic = topic or parsed_topic
-    date = date or parsed_date
-    title_value = f"{title} {date}".strip()
-    lines = [
-        f"<b>Index - {html.escape(str(index))}</b>",
-        f"<b>Title - {html.escape(title_value)}</b>",
-        f"<b>Topic - {html.escape(str(topic))}</b>",
-        f"<b>Batch - {html.escape(str(display_name))}</b>",
-    ]
-    if footer.strip():
-        lines.append(f"<b>Caption - {html.escape(footer.strip())}</b>")
-    return "\n\n".join(lines)
-
-
-async def wait_for_upload_command(chat_id):
-    """Wait while paused and return True when the batch was permanently stopped."""
-    control = ACTIVE_UPLOADS.get(chat_id)
-    if not control:
-        return False
-    while control["paused"].is_set() and not control["fullstop"]:
-        await asyncio.sleep(1)
-    return control["fullstop"]
-
-
 async def smart_sleep(base_delay):
     jitter = random.uniform(JITTER_MIN, JITTER_MAX)
     total = base_delay + jitter
     await asyncio.sleep(total)
 
 
-def _content_type_is_pdf(content_type="", content_disposition=""):
-    """Return True when HTTP metadata identifies a PDF, even without .pdf in URL."""
-    metadata = f"{content_type} {content_disposition}".lower()
-    return "application/pdf" in metadata or "application/x-pdf" in metadata or ".pdf" in metadata
-
-
-async def url_is_pdf(url, headers=None, timeout=30):
-    """Probe a link so extension-less PDF URLs do not enter the video downloader."""
-    try:
-        h = headers or get_asset_headers()
-        response = requests.head(url, headers=h, timeout=timeout, allow_redirects=True)
-        if response.status_code < 400 and _content_type_is_pdf(
-            response.headers.get("Content-Type", ""),
-            response.headers.get("Content-Disposition", ""),
-        ):
-            return True
-        # Some CDNs reject HEAD; a streamed GET still avoids downloading the body.
-        if response.status_code in (403, 405) or not response.headers:
-            response = requests.get(url, headers=h, timeout=timeout, stream=True)
-            is_pdf = _content_type_is_pdf(
-                response.headers.get("Content-Type", ""),
-                response.headers.get("Content-Disposition", ""),
-            )
-            response.close()
-            return is_pdf
-    except Exception as e:
-        print(colored(f"  ⚠️ PDF type probe failed: {e}", "yellow"))
-    return False
-
-
-def is_pdf_file(filepath):
-    """Validate the PDF magic header so an HTML error page is never uploaded as PDF."""
-    try:
-        with open(filepath, "rb") as f:
-            return f.read(5) == b"%PDF-"
-    except (OSError, TypeError):
-        return False
-
-
 async def download_file(url, filepath, headers=None, timeout=120):
-    """Download an asset safely from S3/CloudFront.
-
-    Koyeb instances can see a transient CDN 403 or a connection that closes
-    before a large PDF is complete.  This function first tries a normal
-    streamed GET, then resumes the missing bytes with HTTP Range requests.
-    Every response is checked and data is written to a .part file, so an HTML
-    error page or truncated PDF can never be handed to Telegram.
-    """
-    return await asyncio.to_thread(
-        _download_file_sync, url, filepath, headers, timeout
-    )
-
-
-def _download_file_sync(url, filepath, headers=None, timeout=120):
-    last_error = "unknown download error"
-    header_sets = [headers or get_asset_headers(), get_utkarsh_headers()]
-    part_path = f"{filepath}.part"
-    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-
-    for header_index, base_headers in enumerate(header_sets):
-        h = dict(base_headers)
-        h["Accept-Encoding"] = "identity"
-        request_urls = [url]
-        # Refresh a transient cached CloudFront 403 once; this preserves the
-        # original object path and does not bypass authentication or use a proxy.
-        if header_index == len(header_sets) - 1:
-            separator = "&" if "?" in url else "?"
-            request_urls.append(f"{url}{separator}_download_retry={int(time.time())}")
-        for request_url in request_urls:
-            try:
-                with requests.Session() as session:
-                    response = session.get(
-                        request_url,
-                        headers=h,
-                        timeout=(15, timeout),
-                        stream=True,
-                        allow_redirects=True,
-                    )
-                    if response.status_code != 200:
-                        last_error = f"HTTP {response.status_code}"
-                        response.close()
-                        # A second header profile is useful for CDNs that treat
-                        # mobile and browser clients differently. It is not a
-                        # proxy or an access-control bypass.
-                        continue
-
-                    expected = response.headers.get("Content-Length")
-                    expected = int(expected) if expected and expected.isdigit() else None
-                    written = 0
-                    with open(part_path, "wb") as output:
-                        for chunk in response.iter_content(chunk_size=1024 * 256):
-                            if chunk:
-                                output.write(chunk)
-                                written += len(chunk)
-                    response.close()
-
-                    if written and (expected is None or written == expected):
-                        os.replace(part_path, filepath)
-                        return True
-                    last_error = f"incomplete response ({written}/{expected or '?' } bytes)"
-
-                    # Resume from the exact byte received. This is especially
-                    # important for Koyeb's outbound connection timeout.
-                    if expected and written < expected:
-                        with open(part_path, "ab") as output:
-                            while written < expected:
-                                end = min(written + 1024 * 1024 - 1, expected - 1)
-                                range_headers = dict(h)
-                                range_headers["Range"] = f"bytes={written}-{end}"
-                                range_response = session.get(
-                                    request_url,
-                                    headers=range_headers,
-                                    timeout=(15, timeout),
-                                    stream=True,
-                                    allow_redirects=True,
-                                )
-                                if range_response.status_code != 206:
-                                    last_error = f"range HTTP {range_response.status_code} at byte {written}"
-                                    range_response.close()
-                                    break
-                                range_start = range_response.headers.get("Content-Range", "")
-                                if not range_start.startswith(f"bytes {written}-"):
-                                    last_error = f"invalid Content-Range at byte {written}"
-                                    range_response.close()
-                                    break
-                                chunk_bytes = 0
-                                for chunk in range_response.iter_content(chunk_size=1024 * 256):
-                                    if chunk:
-                                        output.write(chunk)
-                                        chunk_bytes += len(chunk)
-                                range_response.close()
-                                if not chunk_bytes:
-                                    last_error = f"empty range response at byte {written}"
-                                    break
-                                written += chunk_bytes
-                        if written == expected:
-                            os.replace(part_path, filepath)
-                            return True
-            except (requests.RequestException, OSError, ValueError) as exc:
-                last_error = str(exc)
-            finally:
-                # Never leave a corrupt file at the final path.
-                if os.path.exists(part_path) and not os.path.exists(filepath):
-                    try:
-                        os.remove(part_path)
-                    except OSError:
-                        pass
-
-    print(colored(f"  ⚠️ Direct download failed ({last_error}): {url}", "yellow"))
+    try:
+        h = headers or get_utkarsh_headers()
+        r = requests.get(url, headers=h, timeout=timeout, stream=True)
+        if r.status_code == 200:
+            with open(filepath, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            return True
+    except Exception as e:
+        print(colored(f"  ⚠️ Direct download failed: {e}", "yellow"))
     return False
 
 
 async def download_with_ytdlp(url, output_name, quality="720"):
-    header_args = '--add-header "User-Agent:okhttp/3.9.1" --add-header "Accept:*/*" --add-header "Accept-Encoding:gzip"'
+    header_args = '--add-header "Referer:https://utkarshapp.com/" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"'
     if ".pdf" in url.lower():
         cmd = f'yt-dlp {header_args} -o "{output_name}.pdf" "{url}" -R 25 --fragment-retries 25'
     elif ".m3u8" in url.lower() or "jw" in url.lower():
@@ -665,7 +250,6 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
             thumb=thumb_path if os.path.exists(thumb_path) else None,
             width=1280,
             height=720,
-            parse_mode=ParseMode.HTML,
         )
         return True
     except FloodWait as e:
@@ -681,23 +265,6 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
             await cleanup_file(thumb_path)
 
 
-async def upload_photo(bot_client, chat_id, filepath, caption):
-    downloaded_path = filepath
-    try:
-        if not os.path.exists(filepath):
-            return False, "downloaded image file is missing"
-        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption, parse_mode=ParseMode.HTML)
-        return True, ""
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await upload_photo(bot_client, chat_id, filepath, caption)
-    except Exception as e:
-        print(colored(f"  ❌ Upload image error: {e}", "red"))
-        return False, str(e)
-    finally:
-        await cleanup_file(downloaded_path)
-
-
 async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=None):
     downloaded_path = filepath
     try:
@@ -708,7 +275,6 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
             document=filepath,
             caption=caption,
             thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-            parse_mode=ParseMode.HTML,
         )
         return True
     except FloodWait as e:
@@ -720,37 +286,6 @@ async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=Non
     finally:
         # ALWAYS cleanup
         await cleanup_file(downloaded_path)
-
-
-async def upload_document_from_url(bot_client, chat_id, url, caption):
-    """Let Telegram fetch a public document when Koyeb cannot reach its CDN."""
-    try:
-        await bot_client.send_document(chat_id=chat_id, document=url, caption=caption, parse_mode=ParseMode.HTML)
-        return True, ""
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await upload_document_from_url(bot_client, chat_id, url, caption)
-    except Exception as e:
-        print(colored(f"  ❌ Telegram URL upload error: {e}", "red"))
-        return False, str(e)
-
-
-async def upload_photo_from_url(bot_client, chat_id, url, caption):
-    """Let Telegram fetch a public image when Koyeb cannot reach its CDN."""
-    try:
-        await bot_client.send_photo(
-            chat_id=chat_id,
-            photo=url,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-        )
-        return True, ""
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await upload_photo_from_url(bot_client, chat_id, url, caption)
-    except Exception as e:
-        print(colored(f"  ❌ Telegram image URL upload error: {e}", "red"))
-        return False, str(e)
 
 
 def generate_signature(timestamp: str) -> str:
@@ -785,7 +320,6 @@ async def api_request(
     path: str,
     json_data=None,
     retries=MAX_RETRIES,
-    request_timeout=TIMEOUT,
 ):
     async with api_semaphore:
         headers = get_auth_headers(token)
@@ -794,7 +328,7 @@ async def api_request(
             try:
                 if method == "GET":
                     async with session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=request_timeout)
+                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
                     ) as resp:
                         text = await resp.text()
                         data = json.loads(text) if text else {}
@@ -814,7 +348,7 @@ async def api_request(
                         return data
                 elif method == "POST":
                     async with session.post(
-                        url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=request_timeout)
+                        url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
                     ) as resp:
                         text = await resp.text()
                         data = json.loads(text) if text else {}
@@ -880,43 +414,6 @@ async def search_batches(session, token, keyword):
 # ═══════════════════════════════════════════════════════════════
 # SHARED UPLOAD FLOW
 # ═══════════════════════════════════════════════════════════════
-@app.on_message(filters.command(["pause", "stop"]))
-async def pause_upload_handler(app_client, m):
-    control = ACTIVE_UPLOADS.get(m.chat.id)
-    if not control:
-        await m.reply_text("ℹ️ Is chat me koi active upload nahi hai.")
-        return
-    control["paused"].set()
-    await m.reply_text("⏸️ Upload pause kar diya gaya. Current file ke baad rukega. Resume ke liye /resume bheje.")
-
-
-@app.on_message(filters.command(["resume"]))
-async def resume_upload_handler(app_client, m):
-    control = ACTIVE_UPLOADS.get(m.chat.id)
-    if not control:
-        await m.reply_text("ℹ️ Resume karne ke liye saved upload state nahi mili. Batch dobara start karein.")
-        return
-    if control["fullstop"]:
-        await m.reply_text("🚫 Ye batch /fullstop se permanently cancel ho chuka hai; resume nahi hoga.")
-        return
-    control["paused"].clear()
-    await m.reply_text("▶️ Upload resume kar diya gaya.")
-
-
-@app.on_message(filters.command(["fullstop"]))
-async def fullstop_upload_handler(app_client, m):
-    control = ACTIVE_UPLOADS.get(m.chat.id)
-    if not control:
-        await m.reply_text("ℹ️ Is chat me koi active upload nahi hai.")
-        return
-    control["fullstop"] = True
-    control["paused"].clear()
-    upload_state = load_upload_state()
-    upload_state.pop(control["state_key"], None)
-    save_upload_state(upload_state)
-    await m.reply_text("🛑 Batch permanently stop kar diya gaya. Is batch ko resume nahi kiya ja sakta.")
-
-
 async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     chat_id = m.chat.id
 
@@ -947,8 +444,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         try:
             test_msg = await app_client.send_message(ch_text, "🔄 Bot connected! Starting upload...")
             await test_msg.delete()
-            target_chat = int(ch_text) if re.fullmatch(r"-100\d+", ch_text) else ch_text
-            print(colored(f"  ✅ Upload target locked: {target_chat}", "green"))
+            target_chat = ch_text
         except Exception as e:
             await m.reply_text(f"❌ Failed to access channel!\nError: {str(e)}\n\nMake sure bot is ADMIN in that channel.")
             return False, None
@@ -974,18 +470,6 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     if quality not in ["144", "240", "360", "480", "720", "1080"]:
         quality = "720"
 
-    caption_msg = await m.reply_text(
-        "✍️ <b>Caption footer bheje</b>\n\n"
-        "Ye text har video/PDF/file ke caption ke last me aayega.\n"
-        "Default me koi footer nahi hoga. Footer nahi chahiye to <code>no</code> bheje:"
-    )
-    caption_input = await app_client.listen(chat_id=chat_id)
-    caption_footer = caption_input.text.strip()
-    await caption_input.delete()
-    await caption_msg.delete()
-    if caption_footer.lower() in {"no", "none", "skip", "-"}:
-        caption_footer = ""
-
     thumb_msg = await m.reply_text(
         "🖼 <b>Send Thumbnail URL</b> (or send <code>no</code> to skip):"
     )
@@ -998,38 +482,10 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     if thumb_url.startswith("http"):
         thumb_path = "custom_thumb.jpg"
         try:
-            r = requests.get(
-                thumb_url,
-                headers=get_asset_headers(),
-                timeout=30,
-                allow_redirects=True,
-            )
-            r.raise_for_status()
-            if not r.content or not r.headers.get("Content-Type", "").lower().startswith("image/"):
-                raise ValueError("thumbnail URL did not return an image")
+            r = requests.get(thumb_url)
             with open(thumb_path, "wb") as f:
                 f.write(r.content)
-            # Telegram thumbnails must be small; normalize S3 images before upload.
-            optimized_thumb = "custom_thumb_optimized.jpg"
-            thumb_result = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", thumb_path,
-                    "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-                    "-q:v", "6", optimized_thumb,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if thumb_result.returncode != 0 or not os.path.exists(optimized_thumb):
-                raise RuntimeError(f"ffmpeg thumbnail conversion failed: {thumb_result.stderr[-300:]}")
-            os.replace(optimized_thumb, thumb_path)
-            thumb_size = os.path.getsize(thumb_path)
-            if thumb_size > 200 * 1024:
-                raise ValueError(f"thumbnail is too large after compression ({thumb_size} bytes)")
-            print(colored(f"  ✅ Thumbnail ready: {thumb_size} bytes", "green"))
-        except Exception as e:
-            print(colored(f"  ⚠️ Thumbnail download failed: {e}; using video frame", "yellow"))
+        except:
             thumb_path = None
 
     # Resume check
@@ -1037,44 +493,47 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     upload_state = load_upload_state()
     resume_index = 0
 
-    saved_state = upload_state.get(state_key, {})
-    saved_index = int(saved_state.get("last_index", 0) or 0)
-    saved_count = int(saved_state.get("count", saved_index + 1) or (saved_index + 1))
-    saved_success = int(saved_state.get("success", 0) or 0)
-    saved_failed = int(saved_state.get("failed", 0) or 0)
-    default_start = saved_index + 1 if saved_index > 0 else 1
+    if state_key in upload_state:
+        resume_data = upload_state[state_key]
+        resume_index = resume_data.get("last_index", 0)
+        resume_count = resume_data.get("count", 1)
+        resume_success = resume_data.get("success", 0)
+        resume_failed = resume_data.get("failed", 0)
 
-    start_prompt = await m.reply_text(
-        "🔢 <b>Starting link number</b>\n\n"
-        f"Total links: <code>{len(all_urls)}</code>\n"
-        f"Saved progress: <code>{default_start}</code> (if available)\n\n"
-        "Upload kis link number se start karna hai?\n"
-        "Example: <code>15</code>\n"
-        "Saved progress se continue karne ke liye Enter ki jagah <code>resume</code> likhein."
-    )
-    start_input = await app_client.listen(chat_id=chat_id)
-    requested_start = (start_input.text or "").strip().lower()
-    await start_input.delete()
-    await start_prompt.delete()
+        if resume_index > 0 and resume_index < len(all_urls):
+            resume_msg = await m.reply_text(
+                f"🔄 <b>Resume Found!</b>\n\n"
+                f"📁 Batch: <b>{display_name}</b>\n"
+                f"📊 Progress: <code>{resume_index}/{len(all_urls)}</code>\n\n"
+                f"Reply <code>yes</code> to RESUME from file {resume_count}\n"
+                f"Reply <code>no</code> to START FRESH"
+            )
+            resume_input = await app_client.listen(chat_id=chat_id)
+            resume_choice = resume_input.text.strip().lower()
+            await resume_input.delete()
+            await resume_msg.delete()
 
-    if requested_start == "resume" and saved_index > 0:
-        resume_index = saved_index
-        resume_count = saved_count
-        resume_success = saved_success
-        resume_failed = saved_failed
+            if resume_choice == "yes":
+                print(colored(f"🔄 Resuming upload from index {resume_index}", "cyan"))
+            else:
+                resume_index = 0
+                resume_count = 1
+                resume_success = 0
+                resume_failed = 0
+                upload_state.pop(state_key, None)
+                save_upload_state(upload_state)
+        else:
+            upload_state.pop(state_key, None)
+            save_upload_state(upload_state)
+            resume_index = 0
+            resume_count = 1
+            resume_success = 0
+            resume_failed = 0
     else:
-        try:
-            selected_number = int(requested_start or default_start)
-        except ValueError:
-            selected_number = default_start
-        selected_number = max(1, min(selected_number, len(all_urls)))
-        resume_index = selected_number - 1
-        resume_count = selected_number
+        resume_index = 0
+        resume_count = 1
         resume_success = 0
         resume_failed = 0
-        # A manually selected starting point is a new resumable run.
-        upload_state.pop(state_key, None)
-        save_upload_state(upload_state)
 
     start_msg = await m.reply_text(
         f"🚀 <b>Starting Upload!</b>\n\n"
@@ -1085,27 +544,12 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"🔄 Starting from: <code>{resume_index + 1}</code>\n\n"
         f"⏳ Downloading..."
     )
-    progress_msg = await m.reply_text(
-        "⏳ <b>Uploading</b>\n"
-        "├ Progress » <code>0.0%</code>\n"
-        f"├ Processed » <code>0/{len(all_urls)}</code>\n"
-        f"└ Target » <code>{target_chat}</code>\n\n"
-        "Use /pause, /resume or /fullstop"
-    )
 
     count = resume_count
     failed = resume_failed
     success = resume_success
-    control = {"paused": asyncio.Event(), "fullstop": False, "state_key": state_key}
-    ACTIVE_UPLOADS[chat_id] = control
 
     for idx in range(resume_index, len(all_urls)):
-        if await wait_for_upload_command(chat_id):
-            upload_state.pop(state_key, None)
-            save_upload_state(upload_state)
-            ACTIVE_UPLOADS.pop(chat_id, None)
-            await safe_edit_message(start_msg, "🛑 <b>Batch permanently stopped.</b>\nResume state deleted.")
-            return False, display_name
         link_line = all_urls[idx]
         downloaded_file = None
         try:
@@ -1126,21 +570,9 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                 "failed": failed,
                 "batch_name": display_name,
                 "target_chat": str(target_chat),
-                "caption_footer": caption_footer,
                 "timestamp": time.time()
             }
             save_upload_state(upload_state)
-
-            await safe_edit_message(
-                progress_msg,
-                "⏳ <b>Uploading</b>\n"
-                f"├ Progress » <code>{(idx / len(all_urls) * 100) if all_urls else 0:.1f}%</code>\n"
-                f"├ Processed » <code>{idx}/{len(all_urls)}</code>\n"
-                f"├ Success » <code>{success}</code>  Failed » <code>{failed}</code>\n"
-                f"├ Target » <code>{target_chat}</code>\n"
-                f"└ Current » <code>{safe_title[:45]}</code>\n\n"
-                "Use /pause, /resume or /fullstop"
-            )
 
             # Show storage status every 5 files
             if count % 5 == 0:
@@ -1155,28 +587,17 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     f"📝 Current: <code>{safe_title[:30]}</code>"
                 )
 
-            normalized_url = requests.utils.unquote(url).lower()
-            is_note = ".ws" in normalized_url or "file_manager/notes" in normalized_url
-            is_batch_thumbnail = title.startswith("[BATCH THUMBNAIL]")
-            is_image = is_batch_thumbnail or any(
-                ext in normalized_url.split("?")[0]
-                for ext in (".jpg", ".jpeg", ".png", ".webp")
-            )
-            is_pdf = (
-                ".pdf" in normalized_url
-                or "pannel-files" in normalized_url
-                or "file_manager/pdf" in normalized_url
-                or (not is_note and not is_image and await url_is_pdf(url))
-            )
-            is_m3u8 = ".m3u8" in normalized_url
+            is_pdf = ".pdf" in url.lower() or "pannel-files" in url
+            is_note = ".ws" in url.lower() or "file_manager/notes" in url
+            is_m3u8 = ".m3u8" in url.lower()
 
-            cap_vid = build_caption(count, "🎥", title, display_name, caption_footer)
-            cap_pdf = build_caption(count, "📁", title, display_name, caption_footer)
-            cap_note = build_caption(count, "📝", title, display_name, caption_footer)
+            cap_vid = f"**[{str(count).zfill(3)}] 🎥 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
+            cap_pdf = f"**[{str(count).zfill(3)}] 📁 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
+            cap_note = f"**[{str(count).zfill(3)}] 📝 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
 
             if is_note:
                 note_path = f"{name_prefix}.txt"
-                headers = get_asset_headers()
+                headers = get_utkarsh_headers()
                 r = requests.get(url, headers=headers, timeout=30)
                 if r.status_code == 200:
                     with open(note_path, "w", encoding="utf-8") as f:
@@ -1187,114 +608,25 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                         success += 1
                     else:
                         failed += 1
-                        await app_client.send_message(
-                            chat_id=chat_id,
-                            text=f"❌ <b>Note upload failed:</b> <code>{safe_title}</code>"
-                        )
                 else:
-                    url_ok, url_error = await upload_document_from_url(
-                        app_client, target_chat, url, cap_note
-                    )
-                    if url_ok:
-                        success += 1
-                        count += 1
-                        upload_state[state_key].update({
-                            "last_index": idx + 1,
-                            "count": count,
-                            "success": success,
-                            "failed": failed,
-                        })
-                        save_upload_state(upload_state)
-                        await asyncio.sleep(2)
-                        continue
                     failed += 1
-                    await app_client.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ <b>Failed note download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>\n🛑 <code>{url_error[:300]}</code>"
-                    )
-
-            elif is_image:
-                image_path = f"{name_prefix}.jpg"
-                ok = await download_file(url, image_path)
-                if ok and os.path.exists(image_path) and os.path.getsize(image_path) > 100:
-                    downloaded_file = image_path
-                    ok, upload_error = await upload_photo(app_client, target_chat, image_path, cap_pdf)
-                    if ok:
-                        success += 1
-                    else:
-                        failed += 1
-                        await app_client.send_message(
-                            chat_id=chat_id,
-                            text=f"❌ <b>Image upload failed:</b> <code>{safe_title}</code>\n🛑 <code>{upload_error[:300]}</code>"
-                        )
-                else:
-                    url_ok, url_error = await upload_photo_from_url(
-                        app_client, target_chat, url, cap_pdf
-                    )
-                    if url_ok:
-                        success += 1
-                        count += 1
-                        upload_state[state_key].update({
-                            "last_index": idx + 1,
-                            "count": count,
-                            "success": success,
-                            "failed": failed,
-                        })
-                        save_upload_state(upload_state)
-                        await asyncio.sleep(2)
-                        continue
-                    failed += 1
-                    await app_client.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ <b>Image download failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>\n🛑 <code>{url_error[:300]}</code>"
-                    )
 
             elif is_pdf:
                 pdf_path = f"{name_prefix}.pdf"
                 ok = await download_file(url, pdf_path)
                 if not ok:
-                    # Koyeb's egress IP can be blocked while Telegram's
-                    # media network can still fetch the same public object.
-                    url_ok, url_error = await upload_document_from_url(
-                        app_client, target_chat, url, cap_pdf
-                    )
-                    if url_ok:
-                        success += 1
-                        count += 1
-                        upload_state[state_key].update({
-                            "last_index": idx + 1,
-                            "count": count,
-                            "success": success,
-                            "failed": failed,
-                        })
-                        save_upload_state(upload_state)
-                        await asyncio.sleep(2)
-                        continue
                     downloaded = await download_with_ytdlp(url, name_prefix, quality)
                     if downloaded:
                         pdf_path = downloaded
-                if (
-                    os.path.exists(pdf_path)
-                    and os.path.getsize(pdf_path) > 1000
-                    and is_pdf_file(pdf_path)
-                ):
+                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
                     downloaded_file = pdf_path
-                    # Telegram document uploads do not need a video thumbnail.
-                    ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf)
+                    ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf, thumb_path)
                     if ok:
                         success += 1
                     else:
                         failed += 1
-                        await app_client.send_message(
-                            chat_id=chat_id,
-                            text=f"❌ <b>PDF upload failed:</b> <code>{safe_title}</code>\n📄 Direct CDN download and Telegram URL fallback both failed.\n🛑 <code>{url_error[:300] if 'url_error' in locals() and url_error else 'Check source CDN access.'}</code>"
-                        )
                 else:
                     failed += 1
-                    await app_client.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ <b>Failed PDF download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
-                    )
 
             else:
                 video_path = None
@@ -1314,63 +646,19 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     else:
                         failed += 1
                 else:
-                    # Extensionless/file-library URLs may still be valid
-                    # media. Let Telegram fetch the public URL directly.
-                    url_ok, url_error = await upload_document_from_url(
-                        app_client, target_chat, url, cap_vid
-                    )
-                    if url_ok:
-                        success += 1
-                        count += 1
-                        upload_state[state_key].update({
-                            "last_index": idx + 1,
-                            "count": count,
-                            "success": success,
-                            "failed": failed,
-                        })
-                        save_upload_state(upload_state)
-                        await asyncio.sleep(2)
-                        continue
                     failed += 1
                     await app_client.send_message(
                         chat_id=chat_id,
-                        text=f"❌ <b>Failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>\n🛑 <code>{url_error[:300]}</code>"
+                        text=f"❌ <b>Failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:60]}...</code>"
                     )
 
             count += 1
-            upload_state[state_key].update({
-                "last_index": idx + 1,
-                "count": count,
-                "success": success,
-                "failed": failed,
-            })
-            save_upload_state(upload_state)
             await asyncio.sleep(2)
 
         except Exception as e:
-            error_text = str(e) or e.__class__.__name__
-            print(colored(f"❌ Error processing {link_line}: {error_text}", "red"))
+            print(colored(f"❌ Error processing {link_line}: {e}", "red"))
             failed += 1
             count += 1
-            if state_key in upload_state:
-                upload_state[state_key].update({
-                    "last_index": idx + 1,
-                    "count": count,
-                    "success": success,
-                    "failed": failed,
-                })
-                save_upload_state(upload_state)
-            try:
-                await app_client.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"❌ <b>Error processing file:</b> <code>{safe_title if 'safe_title' in locals() else 'Unknown'}</code>\n"
-                        f"🛑 <code>{error_text[:500]}</code>\n"
-                        f"🔗 <code>{url[:100] if 'url' in locals() else link_line[:100]}</code>"
-                    ),
-                )
-            except Exception as notify_error:
-                print(colored(f"  ⚠️ Could not notify user: {notify_error}", "yellow"))
         finally:
             # EMERGENCY: Always cleanup after each file
             if downloaded_file:
@@ -1395,20 +683,10 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"💾 Storage: <code>0 MB</code> (cleaned)\n\n"
         f"🎉 All Done!"
     )
-    await safe_edit_message(
-        progress_msg,
-        "✅ <b>Uploading complete</b>\n"
-        "├ Progress » <code>100.0%</code>\n"
-        f"├ Processed » <code>{len(all_urls)}/{len(all_urls)}</code>\n"
-        f"├ Success » <code>{success}</code>  Failed » <code>{failed}</code>\n"
-        f"└ Target » <code>{target_chat}</code>"
-    )
 
-    for temporary_asset in (thumb_path, "custom_thumb_optimized.jpg"):
-        if temporary_asset and os.path.exists(temporary_asset):
-            os.remove(temporary_asset)
+    if thumb_path and os.path.exists(thumb_path):
+        os.remove(thumb_path)
 
-    ACTIVE_UPLOADS.pop(chat_id, None)
     return True, display_name
 
 
@@ -1619,12 +897,7 @@ async def handle_utk_logic(app_client, m):
         login_msg = f"<b>✅ {appname} Login Successful</b>\n"
         login_msg += f"\n<b>🆔 Credentials:</b> <code>{raw_text}</code>\n\n"
         login_msg += f"\n<b>📚 {mode_text}</b> — <b>{len(batches)} batches found</b>\n\n{cool}"
-        # Logging is best-effort. If the configured dump channel is unknown to
-        # this user session (PEER_ID_INVALID), still show valid results below.
-        try:
-            await app_client.send_message(txt_dump, login_msg)
-        except Exception as log_error:
-            print(colored(f"⚠️ Could not send batch list to dump channel: {log_error}", "yellow"))
+        await app_client.send_message(txt_dump, login_msg)
         await editable.edit(f"{FFF}\n\n<b>{mode_text}</b> — {len(batches)} batches\n\n{cool}")
 
         editable1 = await m.reply_text(
@@ -1656,25 +929,14 @@ async def handle_utk_logic(app_client, m):
                     await progress_msg.edit(f"❌ Batch ID <code>{batch_id}</code> not found!")
                     continue
 
-                sub_batches = response_items(batch_details, ("batches",))
+                sub_batches = batch_details.get("data", [])
                 bname = next(
                     (x["title"] for x in sub_batches if str(x.get("_id") or x.get("id")) == batch_id),
                     f"Batch_{batch_id}",
                 )
                 print(colored(f"\n📦 Processing batch: {bname} (ID: {batch_id})", "cyan"))
                 all_urls = []
-                seen_links = set()
                 total_links = 0
-                batch_thumbnail = extract_thumbnail_link(batch_details)
-                if not batch_thumbnail:
-                    for sub_batch in sub_batches:
-                        batch_thumbnail = extract_thumbnail_link(sub_batch)
-                        if batch_thumbnail:
-                            break
-                if batch_thumbnail:
-                    all_urls.append(f"[BATCH THUMBNAIL] {bname}: {batch_thumbnail}")
-                    seen_links.add(batch_thumbnail)
-                    total_links += 1
 
                 state[resume_key] = {
                     "extracting": True,
@@ -1687,8 +949,8 @@ async def handle_utk_logic(app_client, m):
                 save_state(state)
 
                 for sub_batch in sub_batches:
+                    parent_id = sub_batch.get("parentId") or sub_batch.get("parent_id") or batch_id
                     sub_batch_id = sub_batch.get("_id") or sub_batch.get("id")
-                    parent_id = sub_batch.get("parentId") or sub_batch.get("parent_id") or sub_batch_id or batch_id
                     subjects_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/details")
                     if subjects_resp.get("status") == 429:
                         print(colored("⚠️ Rate limit during subjects fetch, saving state...", "yellow"))
@@ -1702,34 +964,12 @@ async def handle_utk_logic(app_client, m):
                         return
                     if not subjects_resp or not subjects_resp.get("success"):
                         continue
-                    subjects = response_items(subjects_resp, ("subjects",))
+                    subjects = subjects_resp.get("data", [])
                     print(colored(f"  📚 {len(subjects)} subjects in sub-batch {sub_batch_id}", "cyan"))
-                    try:
-                        await progress_msg.edit(
-                            f"⏳ <b>Processing {bname}</b>\n"
-                            f"├─ Sub-batch: <code>{sub_batch_id}</code>\n"
-                            f"├─ Subjects: <code>{len(subjects)}</code>\n"
-                            f"└─ Links found: <code>{total_links}</code>"
-                        )
-                    except Exception:
-                        pass
+                    await smart_sleep(SUBJECT_PAUSE)
 
-                    for subject_index, subject in enumerate(subjects, start=1):
+                    for subject in subjects:
                         subject_id = subject.get("_id") or subject.get("id")
-                        subject_name = subject.get("title", "Unknown subject")
-                        print(colored(
-                            f"    🔎 Subject {subject_index}/{len(subjects)}: {subject_name}",
-                            "white",
-                        ))
-                        try:
-                            await progress_msg.edit(
-                                f"⏳ <b>Processing {bname}</b>\n"
-                                f"├─ Subject: <code>{subject_index}/{len(subjects)}</code>\n"
-                                f"├─ Current: {html.escape(str(subject_name))[:80]}\n"
-                                f"└─ Links found: <code>{total_links}</code>"
-                            )
-                        except Exception:
-                            pass
                         topics_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/details")
                         if topics_resp.get("status") == 429:
                             print(colored("⚠️ Rate limit during topics fetch, saving state...", "yellow"))
@@ -1743,23 +983,12 @@ async def handle_utk_logic(app_client, m):
                             return
                         if not topics_resp or not topics_resp.get("success"):
                             continue
-                        topics = response_items(topics_resp, ("topics",))
-                        print(colored(f"      📖 {len(topics)} topics", "white"))
+                        topics = topics_resp.get("data", [])
+                        await smart_sleep(TOPIC_PAUSE)
 
                         for topic in topics:
                             topic_id = topic.get("_id") or topic.get("id")
-                            try:
-                                contents_resp = await api_request(
-                                    session,
-                                    token,
-                                    "GET",
-                                    f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details",
-                                    retries=2,
-                                    request_timeout=30,
-                                )
-                            except Exception as topic_error:
-                                print(colored(f"      ⚠️ Skipping topic {topic_id}: {topic_error}", "yellow"))
-                                continue
+                            contents_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/subject/{subject_id}/topic/{topic_id}/details")
                             if contents_resp.get("status") == 429:
                                 print(colored("⚠️ Rate limit during contents fetch, saving state...", "yellow"))
                                 state[resume_key]["urls"] = all_urls
@@ -1772,31 +1001,13 @@ async def handle_utk_logic(app_client, m):
                                 return
                             if not contents_resp or not contents_resp.get("success"):
                                 continue
-                            contents = response_items(contents_resp, ("contents",))
+                            contents = contents_resp.get("data", [])
+                            await smart_sleep(CONTENT_PAUSE)
 
                             for content in contents:
-                                content_id = extract_content_id(content)
-                                content_title = (
-                                    content.get("title", "Unknown")
-                                    if isinstance(content, dict)
-                                    else "Unknown"
-                                )
-                                direct_links = extract_content_links(content)
-                                if direct_links:
-                                    detail_resp = {"success": True, "data": {"links": direct_links}}
-                                else:
-                                    try:
-                                        detail_resp = await api_request(
-                                            session,
-                                            token,
-                                            "GET",
-                                            f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details",
-                                            retries=2,
-                                            request_timeout=30,
-                                        )
-                                    except Exception as content_error:
-                                        print(colored(f"        ⚠️ Skipping content {content_id}: {content_error}", "yellow"))
-                                        continue
+                                content_id = content.get("id") or content.get("_id")
+                                content_title = content.get("title", "Unknown")
+                                detail_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details")
                                 if detail_resp.get("status") == 429:
                                     print(colored("⚠️ Rate limit during link fetch, saving state...", "yellow"))
                                     state[resume_key]["urls"] = all_urls
@@ -1809,12 +1020,10 @@ async def handle_utk_logic(app_client, m):
                                     return
                                 if not detail_resp or not detail_resp.get("success"):
                                     continue
-                                links = extract_content_links(detail_resp)
-                                for link in links:
+                                data = detail_resp.get("data", {})
+                                link = data.get("link", "")
+                                if link:
                                     safe_title = content_title.replace("||", "-").replace(":", "-").replace("/", "-")
-                                    if link in seen_links:
-                                        continue
-                                    seen_links.add(link)
                                     all_urls.append(f"{safe_title}: {link}")
                                     total_links += 1
                                     if total_links % 50 == 0:
@@ -1826,6 +1035,7 @@ async def handle_utk_logic(app_client, m):
                                         )
                                     state[resume_key]["urls"] = all_urls
                                     save_state(state)
+                                await smart_sleep(1)
 
                 if not all_urls:
                     await progress_msg.edit(f"⚠️ No content URLs found in batch <code>{bname}</code>")
