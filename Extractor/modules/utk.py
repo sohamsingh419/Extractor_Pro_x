@@ -144,6 +144,16 @@ async def get_folder_size():
         return 0
 
 
+def get_asset_headers():
+    """Headers accepted by Utkarsh S3 assets (images/PDFs/video files)."""
+    return {
+        "User-Agent": "okhttp/3.9.1",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+        "Connection": "keep-alive",
+    }
+
+
 def get_utkarsh_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -172,23 +182,71 @@ async def smart_sleep(base_delay):
     await asyncio.sleep(total)
 
 
-async def download_file(url, filepath, headers=None, timeout=120):
+def _content_type_is_pdf(content_type="", content_disposition=""):
+    """Return True when HTTP metadata identifies a PDF, even without .pdf in URL."""
+    metadata = f"{content_type} {content_disposition}".lower()
+    return "application/pdf" in metadata or "application/x-pdf" in metadata or ".pdf" in metadata
+
+
+async def url_is_pdf(url, headers=None, timeout=30):
+    """Probe a link so extension-less PDF URLs do not enter the video downloader."""
     try:
-        h = headers or get_utkarsh_headers()
-        r = requests.get(url, headers=h, timeout=timeout, stream=True)
-        if r.status_code == 200:
+        h = headers or get_asset_headers()
+        response = requests.head(url, headers=h, timeout=timeout, allow_redirects=True)
+        if response.status_code < 400 and _content_type_is_pdf(
+            response.headers.get("Content-Type", ""),
+            response.headers.get("Content-Disposition", ""),
+        ):
+            return True
+        # Some CDNs reject HEAD; a streamed GET still avoids downloading the body.
+        if response.status_code in (403, 405) or not response.headers:
+            response = requests.get(url, headers=h, timeout=timeout, stream=True)
+            is_pdf = _content_type_is_pdf(
+                response.headers.get("Content-Type", ""),
+                response.headers.get("Content-Disposition", ""),
+            )
+            response.close()
+            return is_pdf
+    except Exception as e:
+        print(colored(f"  ⚠️ PDF type probe failed: {e}", "yellow"))
+    return False
+
+
+def is_pdf_file(filepath):
+    """Validate the PDF magic header so an HTML error page is never uploaded as PDF."""
+    try:
+        with open(filepath, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except (OSError, TypeError):
+        return False
+
+
+async def download_file(url, filepath, headers=None, timeout=120):
+    last_error = "unknown download error"
+    header_sets = [headers or get_asset_headers(), get_utkarsh_headers()]
+    for h in header_sets:
+        try:
+            r = requests.get(url, headers=h, timeout=timeout, stream=True, allow_redirects=True)
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}"
+                r.close()
+                continue
             with open(filepath, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            return True
-    except Exception as e:
-        print(colored(f"  ⚠️ Direct download failed: {e}", "yellow"))
+            r.close()
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return True
+            last_error = "empty response"
+        except Exception as e:
+            last_error = str(e)
+    print(colored(f"  ⚠️ Direct download failed ({last_error}): {url}", "yellow"))
     return False
 
 
 async def download_with_ytdlp(url, output_name, quality="720"):
-    header_args = '--add-header "Referer:https://utkarshapp.com/" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"'
+    header_args = '--add-header "User-Agent:okhttp/3.9.1" --add-header "Accept:*/*" --add-header "Accept-Encoding:gzip"'
     if ".pdf" in url.lower():
         cmd = f'yt-dlp {header_args} -o "{output_name}.pdf" "{url}" -R 25 --fragment-retries 25'
     elif ".m3u8" in url.lower() or "jw" in url.lower():
@@ -263,6 +321,23 @@ async def upload_video(bot_client, chat_id, filepath, caption, thumb_path=None, 
         await cleanup_file(downloaded_path)
         if thumb_path and thumb_path != "custom_thumb.jpg":
             await cleanup_file(thumb_path)
+
+
+async def upload_photo(bot_client, chat_id, filepath, caption):
+    downloaded_path = filepath
+    try:
+        if not os.path.exists(filepath):
+            return False, "downloaded image file is missing"
+        await bot_client.send_photo(chat_id=chat_id, photo=filepath, caption=caption)
+        return True, ""
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return await upload_photo(bot_client, chat_id, filepath, caption)
+    except Exception as e:
+        print(colored(f"  ❌ Upload image error: {e}", "red"))
+        return False, str(e)
+    finally:
+        await cleanup_file(downloaded_path)
 
 
 async def upload_document(bot_client, chat_id, filepath, caption, thumb_path=None):
@@ -482,10 +557,38 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
     if thumb_url.startswith("http"):
         thumb_path = "custom_thumb.jpg"
         try:
-            r = requests.get(thumb_url)
+            r = requests.get(
+                thumb_url,
+                headers=get_asset_headers(),
+                timeout=30,
+                allow_redirects=True,
+            )
+            r.raise_for_status()
+            if not r.content or not r.headers.get("Content-Type", "").lower().startswith("image/"):
+                raise ValueError("thumbnail URL did not return an image")
             with open(thumb_path, "wb") as f:
                 f.write(r.content)
-        except:
+            # Telegram thumbnails must be small; normalize S3 images before upload.
+            optimized_thumb = "custom_thumb_optimized.jpg"
+            thumb_result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", thumb_path,
+                    "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+                    "-q:v", "6", optimized_thumb,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if thumb_result.returncode != 0 or not os.path.exists(optimized_thumb):
+                raise RuntimeError(f"ffmpeg thumbnail conversion failed: {thumb_result.stderr[-300:]}")
+            os.replace(optimized_thumb, thumb_path)
+            thumb_size = os.path.getsize(thumb_path)
+            if thumb_size > 200 * 1024:
+                raise ValueError(f"thumbnail is too large after compression ({thumb_size} bytes)")
+            print(colored(f"  ✅ Thumbnail ready: {thumb_size} bytes", "green"))
+        except Exception as e:
+            print(colored(f"  ⚠️ Thumbnail download failed: {e}; using video frame", "yellow"))
             thumb_path = None
 
     # Resume check
@@ -587,9 +690,16 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     f"📝 Current: <code>{safe_title[:30]}</code>"
                 )
 
-            is_pdf = ".pdf" in url.lower() or "pannel-files" in url
-            is_note = ".ws" in url.lower() or "file_manager/notes" in url
-            is_m3u8 = ".m3u8" in url.lower()
+            normalized_url = requests.utils.unquote(url).lower()
+            is_note = ".ws" in normalized_url or "file_manager/notes" in normalized_url
+            is_image = any(ext in normalized_url.split("?")[0] for ext in (".jpg", ".jpeg", ".png", ".webp"))
+            is_pdf = (
+                ".pdf" in normalized_url
+                or "pannel-files" in normalized_url
+                or "file_manager/pdf" in normalized_url
+                or (not is_note and not is_image and await url_is_pdf(url))
+            )
+            is_m3u8 = ".m3u8" in normalized_url
 
             cap_vid = f"**[{str(count).zfill(3)}] 🎥 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
             cap_pdf = f"**[{str(count).zfill(3)}] 📁 {title}**\n📚 **Batch:** {display_name}\n✅ **By Utk Bot**"
@@ -597,7 +707,7 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
 
             if is_note:
                 note_path = f"{name_prefix}.txt"
-                headers = get_utkarsh_headers()
+                headers = get_asset_headers()
                 r = requests.get(url, headers=headers, timeout=30)
                 if r.status_code == 200:
                     with open(note_path, "w", encoding="utf-8") as f:
@@ -608,8 +718,37 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                         success += 1
                     else:
                         failed += 1
+                        await app_client.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ <b>Note upload failed:</b> <code>{safe_title}</code>"
+                        )
                 else:
                     failed += 1
+                    await app_client.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ <b>Failed note download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                    )
+
+            elif is_image:
+                image_path = f"{name_prefix}.jpg"
+                ok = await download_file(url, image_path)
+                if ok and os.path.exists(image_path) and os.path.getsize(image_path) > 100:
+                    downloaded_file = image_path
+                    ok, upload_error = await upload_photo(app_client, target_chat, image_path, cap_pdf)
+                    if ok:
+                        success += 1
+                    else:
+                        failed += 1
+                        await app_client.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ <b>Image upload failed:</b> <code>{safe_title}</code>\n🛑 <code>{upload_error[:300]}</code>"
+                        )
+                else:
+                    failed += 1
+                    await app_client.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ <b>Image download failed:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                    )
 
             elif is_pdf:
                 pdf_path = f"{name_prefix}.pdf"
@@ -618,15 +757,28 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
                     downloaded = await download_with_ytdlp(url, name_prefix, quality)
                     if downloaded:
                         pdf_path = downloaded
-                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+                if (
+                    os.path.exists(pdf_path)
+                    and os.path.getsize(pdf_path) > 1000
+                    and is_pdf_file(pdf_path)
+                ):
                     downloaded_file = pdf_path
-                    ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf, thumb_path)
+                    # Telegram document uploads do not need a video thumbnail.
+                    ok = await upload_document(app_client, target_chat, pdf_path, cap_pdf)
                     if ok:
                         success += 1
                     else:
                         failed += 1
+                        await app_client.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ <b>PDF upload failed:</b> <code>{safe_title}</code>\n📄 File downloaded, but Telegram rejected the upload. Check file size/type."
+                        )
                 else:
                     failed += 1
+                    await app_client.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ <b>Failed PDF download:</b> <code>{safe_title}</code>\n🔗 <code>{url[:100]}</code>"
+                    )
 
             else:
                 video_path = None
@@ -656,9 +808,21 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
             await asyncio.sleep(2)
 
         except Exception as e:
-            print(colored(f"❌ Error processing {link_line}: {e}", "red"))
+            error_text = str(e) or e.__class__.__name__
+            print(colored(f"❌ Error processing {link_line}: {error_text}", "red"))
             failed += 1
             count += 1
+            try:
+                await app_client.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ <b>Error processing file:</b> <code>{safe_title if 'safe_title' in locals() else 'Unknown'}</code>\n"
+                        f"🛑 <code>{error_text[:500]}</code>\n"
+                        f"🔗 <code>{url[:100] if 'url' in locals() else link_line[:100]}</code>"
+                    ),
+                )
+            except Exception as notify_error:
+                print(colored(f"  ⚠️ Could not notify user: {notify_error}", "yellow"))
         finally:
             # EMERGENCY: Always cleanup after each file
             if downloaded_file:
@@ -684,8 +848,9 @@ async def upload_flow(app_client, m, all_urls, bname, source="extractor"):
         f"🎉 All Done!"
     )
 
-    if thumb_path and os.path.exists(thumb_path):
-        os.remove(thumb_path)
+    for temporary_asset in (thumb_path, "custom_thumb_optimized.jpg"):
+        if temporary_asset and os.path.exists(temporary_asset):
+            os.remove(temporary_asset)
 
     return True, display_name
 
