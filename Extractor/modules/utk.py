@@ -244,6 +244,22 @@ def extract_media_urls(payload):
     return found
 
 
+def response_items(payload, *preferred_keys):
+    """Return list records from old/new API envelopes without requiring success=True."""
+    if not isinstance(payload, dict):
+        return payload if isinstance(payload, list) else []
+    candidates = list(preferred_keys) + ["data", "result", "results", "items", "records"]
+    for key in candidates:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = response_items(value, *preferred_keys)
+            if nested:
+                return nested
+    return []
+
+
 def build_caption(index, icon, title, display_name, footer="", topic="", date=""):
     """Build a bold HTML caption without Telegram spoiler/Markdown parsing."""
     title, parsed_topic, parsed_date = parse_title_parts(title)
@@ -1511,9 +1527,12 @@ async def handle_utk_logic(app_client, m):
                             f"💡 Run <code>/utkarsh</code> again and type <code>resume</code> to continue!"
                         )
                         return
-                    if not subjects_resp or not subjects_resp.get("success"):
+                    if not subjects_resp:
                         continue
-                    subjects = subjects_resp.get("data", [])
+                    subjects = response_items(subjects_resp, "subjects")
+                    if not subjects:
+                        print(colored(f"  ⚠️ No subjects in response: {list(subjects_resp)[:20]}", "yellow"))
+                        continue
                     print(colored(f"  📚 {len(subjects)} subjects in sub-batch {sub_batch_id}", "cyan"))
                     await update_extract_progress(progress_msg, bname, "Subjects", total_links, f"section {sub_batch_id}")
                     await smart_sleep(SUBJECT_PAUSE)
@@ -1531,9 +1550,12 @@ async def handle_utk_logic(app_client, m):
                                 f"💡 Run <code>/utkarsh</code> again and type <code>resume</code> to continue!"
                             )
                             return
-                        if not topics_resp or not topics_resp.get("success"):
+                        if not topics_resp:
                             continue
-                        topics = topics_resp.get("data", [])
+                        topics = response_items(topics_resp, "topics")
+                        if not topics:
+                            print(colored(f"  ⚠️ No topics for subject {subject_id}; response keys: {list(topics_resp)[:20]}", "yellow"))
+                            continue
                         await update_extract_progress(progress_msg, bname, "Topics", total_links, f"subject {subject_id}")
                         await smart_sleep(TOPIC_PAUSE)
 
@@ -1550,9 +1572,12 @@ async def handle_utk_logic(app_client, m):
                                     f"💡 Run <code>/utkarsh</code> again and type <code>resume</code> to continue!"
                                 )
                                 return
-                            if not contents_resp or not contents_resp.get("success"):
+                            if not contents_resp:
                                 continue
-                            contents = contents_resp.get("data", [])
+                            contents = response_items(contents_resp, "contents", "content")
+                            if not contents:
+                                print(colored(f"  ⚠️ No contents for topic {topic_id}; response keys: {list(contents_resp)[:20]}", "yellow"))
+                                continue
                             await update_extract_progress(progress_msg, bname, "Contents", total_links, f"topic {topic_id}")
                             await smart_sleep(CONTENT_PAUSE)
 
@@ -1570,7 +1595,7 @@ async def handle_utk_logic(app_client, m):
                                         f"💡 Run <code>/utkarsh</code> again and type <code>resume</code> to continue!"
                                     )
                                     return
-                                if not detail_resp or not detail_resp.get("success"):
+                                if not detail_resp:
                                     continue
                                 data = detail_resp.get("data", {})
                                 links = extract_media_urls(detail_resp)
