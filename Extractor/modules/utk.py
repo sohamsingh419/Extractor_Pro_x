@@ -196,6 +196,46 @@ def parse_title_parts(raw_title):
     return title, topic, date
 
 
+MEDIA_URL_KEYS = {
+    "url", "link", "file", "filepath", "file_path", "fileurl", "file_url",
+    "downloadurl", "download_url", "videourl", "video_url", "pdfurl", "pdf_url",
+    "streamurl", "stream_url", "playurl", "play_url", "contenturl", "content_url",
+    "mediaurl", "media_url", "hls", "m3u8", "source", "src",
+}
+
+
+def extract_media_urls(payload):
+    """Extract media URLs from old and new nested Utkarsh API responses."""
+    found = []
+    seen = set()
+
+    def visit(value, key=""):
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                visit(child_value, str(child_key).lower().replace("-", "_"))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, str):
+            candidate = value.strip()
+            if not candidate.startswith(("http://", "https://")):
+                return
+            normalized_key = key.replace("__", "_")
+            lower_url = candidate.lower()
+            media_hint = (
+                normalized_key in MEDIA_URL_KEYS
+                or any(ext in lower_url for ext in (
+                    ".mp4", ".mkv", ".m3u8", ".pdf", ".jpg", ".jpeg", ".png",
+                    ".webp", ".ws", "/file_manager/", "/file_library/", "cloudfront"
+                )))
+            if media_hint and candidate not in seen:
+                seen.add(candidate)
+                found.append(candidate)
+
+    visit(payload)
+    return found
+
+
 def build_caption(index, icon, title, display_name, footer="", topic="", date=""):
     """Build a bold HTML caption without Telegram spoiler/Markdown parsing."""
     title, parsed_topic, parsed_date = parse_title_parts(title)
@@ -1517,20 +1557,30 @@ async def handle_utk_logic(app_client, m):
                                 if not detail_resp or not detail_resp.get("success"):
                                     continue
                                 data = detail_resp.get("data", {})
-                                link = data.get("link", "")
-                                if link:
+                                links = extract_media_urls(detail_resp)
+                                if not links:
+                                    # Some API revisions put the media object
+                                    # only in the content-list response.
+                                    links = extract_media_urls(content)
+                                if links:
                                     safe_title = content_title.replace("||", "-").replace(":", "-").replace("/", "-")
-                                    all_urls.append(f"{safe_title}: {link}")
-                                    total_links += 1
-                                    if total_links % 50 == 0:
-                                        await safe_edit_message(
-                                            progress_msg,
-                                            f"⏳ <b>Processing {bname}</b>\n"
-                                            f"├─ Links found: {total_links}\n"
-                                            f"└─ Current: <code>{safe_title[:40]}...</code>"
-                                        )
+                                    for link in links:
+                                        all_urls.append(f"{safe_title}: {link}")
+                                        total_links += 1
+                                        if total_links % 50 == 0:
+                                            await safe_edit_message(
+                                                progress_msg,
+                                                f"⏳ <b>Processing {bname}</b>\n"
+                                                f"├─ Links found: {total_links}\n"
+                                                f"└─ Current: <code>{safe_title[:40]}...</code>"
+                                            )
                                     state[resume_key]["urls"] = all_urls
                                     save_state(state)
+                                else:
+                                    print(colored(
+                                        f"  ⚠️ No media URL for content {content_id}; response keys: {list(data)[:20] if isinstance(data, dict) else type(data).__name__}",
+                                        "yellow",
+                                    ))
                                 await smart_sleep(1)
 
                 if not all_urls:
