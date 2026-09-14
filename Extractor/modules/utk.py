@@ -58,6 +58,7 @@ SECRET_KEY = os.environ.get(
     "UTK_SECRET_KEY",
     "1mBD4OQnsBMBaN6oISWwTmryX1lHjkW9XLZhsirCOT0=",
 )
+UTK_AUTH_KEY = os.environ.get("UTK_AUTH_KEY", "").strip()
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjE0NDQ2MTEzIiwiZGV2aWNlX3R5cGUiOiI0IiwidmVyc2lvbl9jb2RlIjoiMSIsImljciI6IjAiLCJpYXQiOjE3ODgyMzYwOTYsImV4cCI6MTc5MDM5NjA5Nn0.Sn6Ad_klMRf3HJmE81ETHXSIGtSs1r4FyflU_77x3wI"
 
 api_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -223,8 +224,12 @@ def extract_media_urls(payload):
             candidate = value.strip()
             if not candidate.startswith(("http://", "https://")):
                 return
+            # These are catalog artwork/placeholders, not downloadable course media.
+            lower_candidate = candidate.lower()
+            if "/thumbnail/" in lower_candidate or "/file_meta/" in lower_candidate:
+                return
             normalized_key = key.replace("__", "_")
-            lower_url = candidate.lower()
+            lower_url = lower_candidate
             key_hint = any(
                 token in normalized_key
                 for token in ("url", "link", "path", "file", "stream", "play", "download", "source", "src")
@@ -622,6 +627,8 @@ def get_auth_headers(token: str = "") -> dict:
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if UTK_AUTH_KEY:
+        headers["X-Auth-Key"] = UTK_AUTH_KEY
     return headers
 
 
