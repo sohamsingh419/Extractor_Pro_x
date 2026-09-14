@@ -35,15 +35,15 @@ UPDATE_DELAY = 1
 UPDATE_INTERVAL = 15
 EDIT_LOCK = asyncio.Lock()
 
-API_DELAY = 0.8
+API_DELAY = 0.15
 MAX_CONCURRENT = 1
 RATE_LIMIT_RETRY = 600
-BATCH_PAUSE = 2
-SUBJECT_PAUSE = 1
-TOPIC_PAUSE = 1
-CONTENT_PAUSE = 0.5
-JITTER_MIN = 0.2
-JITTER_MAX = 0.8
+BATCH_PAUSE = 0.5
+SUBJECT_PAUSE = 0.2
+TOPIC_PAUSE = 0.2
+CONTENT_PAUSE = 0.1
+JITTER_MIN = 0.05
+JITTER_MAX = 0.15
 
 STATE_FILE = "./bot_state.json"
 UPLOAD_STATE_FILE = "./upload_state.json"
@@ -644,6 +644,8 @@ async def api_request(
         headers = get_auth_headers(token)
         url = f"{BASE_URL}{path}"
         for attempt in range(retries):
+            started = time.monotonic()
+            print(colored(f"🔎 API {method} {path} (attempt {attempt + 1}/{retries})", "cyan"), flush=True)
             try:
                 if method == "GET":
                     async with session.get(
@@ -651,6 +653,7 @@ async def api_request(
                     ) as resp:
                         text = await resp.text()
                         data = json.loads(text) if text else {}
+                        print(colored(f"📥 API {resp.status} {path} in {time.monotonic() - started:.1f}s; keys={list(data)[:12] if isinstance(data, dict) else type(data).__name__}", "green" if resp.status < 400 else "yellow"), flush=True)
                         if resp.status == 429 or (data.get("status") == 429):
                             msg = data.get("message", "Rate limit exceeded")
                             if "daily limit" in msg.lower():
@@ -671,6 +674,7 @@ async def api_request(
                     ) as resp:
                         text = await resp.text()
                         data = json.loads(text) if text else {}
+                        print(colored(f"📥 API {resp.status} {path} in {time.monotonic() - started:.1f}s; keys={list(data)[:12] if isinstance(data, dict) else type(data).__name__}", "green" if resp.status < 400 else "yellow"), flush=True)
                         if resp.status == 429 or (data.get("status") == 429):
                             msg = data.get("message", "Rate limit exceeded")
                             if "daily limit" in msg.lower():
@@ -686,12 +690,14 @@ async def api_request(
                         await smart_sleep(API_DELAY)
                         return data
             except aiohttp.ClientError as e:
+                print(colored(f"❌ API network error {path}: {type(e).__name__}: {e}", "red"), flush=True)
                 if attempt == retries - 1:
                     raise
                 wait = (2 ** attempt) + random.randint(3, 10)
                 print(colored(f"  ⚠️ Network retry {attempt + 1}/{retries} after {wait}s: {e}", "yellow"))
                 await asyncio.sleep(wait)
             except Exception as e:
+                print(colored(f"❌ API error {path}: {type(e).__name__}: {e}", "red"), flush=True)
                 if attempt == retries - 1:
                     raise
                 wait = (2 ** attempt) + random.randint(3, 10)
@@ -1509,6 +1515,7 @@ async def handle_utk_logic(app_client, m):
                 await update_extract_progress(progress_msg, bname, "Batch details loaded", 0, f"{len(sub_batches)} sections")
                 all_urls = []
                 total_links = 0
+                processed_contents = 0
 
                 state[resume_key] = {
                     "extracting": True,
@@ -1589,8 +1596,15 @@ async def handle_utk_logic(app_client, m):
                             await smart_sleep(CONTENT_PAUSE)
 
                             for content in contents:
+                                processed_contents += 1
                                 content_id = content.get("id") or content.get("_id")
                                 content_title = content.get("title", "Unknown")
+                                print(colored(f"🎞️ Detail {processed_contents}: content={content_id} topic={topic_id}", "cyan"), flush=True)
+                                if processed_contents % 5 == 0:
+                                    await update_extract_progress(
+                                        progress_msg, bname, "Content details", total_links,
+                                        f"{processed_contents} processed; current {content_id}",
+                                    )
                                 detail_resp = await api_request(session, token, "GET", f"/api/v1/utkarsh/batches/{batch_id}/parent/{parent_id}/contents/{content_id}/details")
                                 if detail_resp.get("status") == 429:
                                     print(colored("⚠️ Rate limit during link fetch, saving state...", "yellow"))
@@ -1633,7 +1647,7 @@ async def handle_utk_logic(app_client, m):
                                         f"  ⚠️ No media URL for content {content_id}; response keys: {list(data)[:20] if isinstance(data, dict) else type(data).__name__}",
                                         "yellow",
                                     ))
-                                await smart_sleep(1)
+                                await smart_sleep(0.05)
 
                 if not all_urls:
                     await progress_msg.edit(f"⚠️ No content URLs found in batch <code>{bname}</code>")
